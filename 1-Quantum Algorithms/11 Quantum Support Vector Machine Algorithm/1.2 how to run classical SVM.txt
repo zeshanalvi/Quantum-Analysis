@@ -1,0 +1,14 @@
+cd %USERPROFILE%\Desktop
+python -m pip install numpy pandas matplotlib openpyxl scikit-learn
+
+python classical_svm_iris_benchmarks.py ^
+  --sizes 1 2 3 4 ^
+  --steps 1000 ^
+  --trials 10 ^
+  --kernel rbf --C 1.0 --gamma scale --degree 3 ^
+  --test-size 0.3 --acc-tol 0.95 ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir carbon_by_country ^
+  --combine --workers 4

@@ -1,0 +1,34 @@
+import os
+
+# These match my original CLI:
+#   python quantum_trotterization_noiseless.py ^
+#     --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+#     --device-power-watts 65 --pue 1.2 ^
+#     --year-select latest ^
+#     --outdir "%USERPROFILE%\Desktop\carbon_by_country" ^
+#     --combine --workers 4 ^
+#     --n-min 2 --n-max 6 --steps "1,2,4,8,16,32" --repeats 2
+
+outdir = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop", "carbon_by_country")
+
+results_trotter_ibm = run_trotterization_ibm_hardware_notebook(
+    n_min=2,
+    n_max=6,
+    steps=(1, 2, 4, 8, 16, 32),
+    repeats=2,
+    J=1.0,
+    h=0.5,
+    T=1.0,
+    seed=7,
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir=outdir,
+    backend_name="ibm_torino",   # change to your IBM backend, i have used ibm-torino here
+    shots=256,                   # light hardware usage
+    workers=1,                   # dear! you can set >1 if you want multiprocessing
+    hardware_trotter_steps=8,    # shallow hardware circuit
+)
+
+results_trotter_ibm["perf_df"].head()

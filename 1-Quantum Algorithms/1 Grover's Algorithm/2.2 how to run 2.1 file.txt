@@ -1,0 +1,29 @@
+import os
+
+#   quantum Grover noiseless run:
+#   n_min=8, n_max=16  => N from 256 to 65,536
+#   trials=10, 1 marked item, accuracy threshold 0.9
+#   CO2 Excel from Desktop, 65 W, PUE 1.2
+
+outdir_qgrover = os.path.join(
+    os.environ.get("USERPROFILE", ""),
+    "Desktop",
+    "QuantumGroverNoiselessOutputs",
+)
+
+results_qgrover = run_quantum_grover_noiseless_notebook(
+    n_min=8,
+    n_max=16,
+    trials=10,
+    marked_count=1,
+    acc_tol=0.9,
+    shots=0,   # set >0 if you want to simulate measurement sampling
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir=outdir_qgrover,
+    seed=7,
+)
+
+results_qgrover["perf_df"].head()

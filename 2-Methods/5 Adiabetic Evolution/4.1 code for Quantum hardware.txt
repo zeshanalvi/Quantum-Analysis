@@ -1,0 +1,1014 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# adiabatic_quantum_ibm_hardware_light_notebook.py
+# Quantum Adiabatic Evolution (TFIM) — IBM Hardware (lightweight)
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports
+#These imports provide system utilities for timing, memory profiling, and filesystem management.
+#NumPy and pandas support numerical computation and structured data analysis.
+#Matplotlib is configured for headless plotting suitable for batch execution environments.
+#Qiskit runtime and circuit components enable execution of quantum workloads on IBM backends, with warnings suppressed for cleaner logs.
+
+import os
+import time
+import math
+import warnings
+import tracemalloc
+from typing import Dict, List, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ------------********------------
+# ------------********------------ Small utilities
+# ------------********------------
+#This small utility ensures that a directory exists before writing outputs.
+#It creates the path if needed while safely ignoring cases where it already exists.
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+#This small utility ensures that a directory exists before writing outputs.
+#It creates the path if needed while safely ignoring cases where it already exists.
+
+def write_excel(df_dict: Dict[str, pd.DataFrame], out_xlsx: str) -> None:
+    try:
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            for sheet, df in df_dict.items():
+                sheet_name = (sheet[:31] or "Sheet1")
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
+        print(f"[OK] Wrote Excel: {out_xlsx}")
+    except Exception as e:
+        print(f"[WARN] Could not write Excel ({e}). Writing CSVs instead.")
+        base = os.path.splitext(out_xlsx)[0]
+        for sheet, df in df_dict.items():
+            csv_path = f"{base}__{sheet}.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"[OK] Wrote CSV fallback: {csv_path}")
+
+#This utility saves a Matplotlib figure to disk with consistent layout and resolution.
+#It closes the figure after saving to free resources and prints a confirmation message.
+
+def save_fig(fig: plt.Figure, path: str, dpi: int = 150) -> None:
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Saved plot: {path}")
+
+
+#This helper resolves a user-specified or default file path, prioritizing files on the Desktop.
+#It supports quoted inputs, absolute and relative paths, and common spreadsheet extensions.
+#If no explicit argument is given, it searches through a list of default candidate filenames.
+#The function returns a validated absolute path or None if no matching file is found.
+
+def resolve_desktop_file(user_arg: str, default_candidates: List[str]) -> Union[str, None]:
+    """
+    Try user_arg; if not found, search Desktop; otherwise try default_candidates.
+    """
+    def exists(p: str) -> bool:
+        return os.path.isfile(p)
+
+    desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+
+    if user_arg:
+        base = user_arg.strip().strip('"').strip("'")
+        # 1) direct path
+        if exists(base):
+            return os.path.abspath(base)
+        # 2) Desktop/basename
+        candidate = os.path.join(desktop, base)
+        if exists(candidate):
+            return os.path.abspath(candidate)
+        # 3) try with extensions on Desktop
+        root, ext = os.path.splitext(base)
+        if not ext:
+            for e in (".xlsx", ".xls", ".csv"):
+                candidate = os.path.join(desktop, root + e)
+                if exists(candidate):
+                    return os.path.abspath(candidate)
+        # 4) case-insensitive Desktop search
+        tail = os.path.split(base)[1].lower()
+        if os.path.isdir(desktop):
+            for fname in os.listdir(desktop):
+                if fname.lower() == tail:
+                    candidate = os.path.join(desktop, fname)
+                    if exists(candidate):
+                        return os.path.abspath(candidate)
+    # Fallback: try default candidates
+    for cand in default_candidates:
+        if exists(cand):
+            return os.path.abspath(cand)
+    return None
+
+def _parse_steps_arg(steps) -> List[int]:
+    """
+    Accepts either:
+      - string: "1,2,4,8,16,32"
+      - iterable: (1,2,4,8,16,32)
+    Returns sorted unique list of ints.
+    """
+    if isinstance(steps, str):
+        parts = [p.strip() for p in steps.replace(",", " ").split() if p.strip()]
+        return sorted({int(p) for p in parts})
+    # assume iterable of ints
+    return sorted({int(m) for m in steps})
+
+# =========================
+# Linear algebra primitives
+# =========================
+#This function defines and returns the four fundamental Pauli operators used in quantum mechanics.
+#Each operator is explicitly constructed as a 2×2 complex-valued matrix for reuse in simulations.
+def paulis():
+    I = np.array([[1, 0], [0, 1]], dtype=complex)
+    X = np.array([[0, 1], [1, 0]], dtype=complex)
+    Y = np.array([[0, -1j], [1j, 0]], dtype=complex)
+    Z = np.array([[1, 0], [0, -1]], dtype=complex)
+    return I, X, Y, Z
+
+#This function computes the matrix exponential of a Hermitian operator using eigen-decomposition.
+#Eigenvalues are converted into complex phase factors to form a unitary evolution operator.
+
+def expm_hermitian(H: np.ndarray, dt: float) -> np.ndarray:
+    w, V = np.linalg.eigh(H)
+    phase = np.exp(-1j * dt * w)
+    return (V * phase) @ V.conj().T
+
+# ------------********------------
+# ------------********------------Statevector gate ops
+# ------------********------------
+
+#This function applies a single-qubit unitary gate to qubit i within an n-qubit statevector.
+#It reshapes and permutes tensor axes to isolate the target qubit, applies the operation, and restores the vector form.
+
+def apply_1q(U: np.ndarray, psi: np.ndarray, n: int, i: int) -> np.ndarray:
+    psi = psi.reshape([2] * n)
+    psi = np.moveaxis(psi, i, 0)
+    psi = (U @ psi.reshape(2, -1)).reshape([2] + [2] * (n - 1))
+    psi = np.moveaxis(psi, 0, i)
+    return psi.reshape(-1)
+
+def apply_2q_nn(U: np.ndarray, psi: np.ndarray, n: int, i: int) -> np.ndarray:
+    psi = psi.reshape([2] * n)
+    psi = np.moveaxis(psi, (i, i + 1), (0, 1))
+    psi = (U @ psi.reshape(4, -1)).reshape([2, 2] + [2] * (n - 2))
+    psi = np.moveaxis(psi, (0, 1), (i, i + 1))
+    return psi.reshape(-1)
+
+# ------------********------------
+# ------------********------------Adiabatic TFIM model
+# ------------********------------
+
+# H(s) = (1 - s) H0 + s H1,  s = t/T
+# H0 = -Gamma * sum X_i
+# H1 = -J sum Z_i Z_{i+1} - h sum Z_i
+
+def build_tfim_components_dense(n: int, J: float, h: float, Gamma: float):
+    I, X, Y, Z = paulis()
+    dim = 2 ** n
+    H0 = np.zeros((dim, dim), dtype=complex)
+    H1 = np.zeros((dim, dim), dtype=complex)
+
+    def s1(i, op):
+        mats = [I] * n
+        mats[i] = op
+        out = mats[0]
+        for m in mats[1:]:
+            out = np.kron(out, m)
+        return out
+
+    def s2(i, j, opi, opj):
+        mats = [I] * n
+        mats[i] = opi
+        mats[j] = opj
+        out = mats[0]
+        for m in mats[1:]:
+            out = np.kron(out, m)
+        return out
+
+    # H0: transverse X
+    for i in range(n):
+        H0 += -Gamma * s1(i, X)
+    # H1: ZZ + Z
+    for i in range(n - 1):
+        H1 += -J * s2(i, i + 1, Z, Z)
+    for i in range(n):
+        H1 += -h * s1(i, Z)
+    return H0, H1
+
+def init_plus_state(n: int) -> np.ndarray:
+    plus = (1/np.sqrt(2)) * np.array([1.0, 1.0], dtype=complex)
+    state = plus
+    for _ in range(n - 1):
+        state = np.kron(state, plus)
+    return state
+
+# ------------********------------
+# ------------********------------ Ideal (gate) evolution per slice
+# ------------********------------
+#This function builds a single-qubit X-rotation unitary using Pauli operators.
+#It represents coherent evolution generated by the X Hamiltonian term.
+
+def Ux(theta: float) -> np.ndarray:
+    I, X, Y, Z = paulis()
+    return np.cos(theta) * I - 1j * np.sin(theta) * X
+
+#This function constructs a single-qubit Z-rotation unitary as a diagonal phase matrix.
+#It is commonly used to model Z-field evolution in spin systems.
+
+
+def Uz(theta: float) -> np.ndarray:
+    return np.array([[np.exp(-1j * theta), 0],
+                     [0, np.exp( 1j * theta)]], dtype=complex)
+
+#This function creates a two-qubit ZZ interaction unitary as a diagonal operator.
+#It encodes phase evolution corresponding to Ising-type couplings.
+
+def Uzz(theta: float) -> np.ndarray:
+    return np.diag([np.exp(-1j * theta), np.exp(1j * theta),
+                    np.exp(1j * theta),  np.exp(-1j * theta)]).astype(complex)
+
+
+#This routine simulates noiseless adiabatic evolution using gate-level Trotterization.
+#It applies time-dependent X, Z, and ZZ gates according to a linear interpolation schedule.
+#Even and odd bond updates are alternated to respect nearest-neighbor structure.
+#The statevector is updated iteratively to approximate continuous adiabatic dynamics.
+
+def simulate_adiabatic_gate_noiseless(
+    n: int,
+    J: float,
+    h: float,
+    Gamma: float,
+    T: float,
+    m_steps: int,
+    psi0: np.ndarray,
+) -> np.ndarray:
+    dt = T / m_steps
+    psi = psi0.copy()
+    for k in range(m_steps):
+        t = (k + 0.5) * dt
+        s = t / T
+        theta_x = dt * (1.0 - s) * Gamma
+        theta_zz = dt * s * J
+        theta_z = dt * s * h
+
+        U1x = Ux(theta_x)
+        U1z = Uz(theta_z)
+        U2zz = Uzz(theta_zz)
+
+        # even bonds
+        for i in range(0, n - 1, 2):
+            psi = apply_2q_nn(U2zz, psi, n, i)
+        # odd bonds
+        for i in range(1, n - 1, 2):
+            psi = apply_2q_nn(U2zz, psi, n, i)
+        # Z fields
+        for i in range(n):
+            psi = apply_1q(U1z, psi, n, i)
+        # X fields
+        for i in range(n):
+            psi = apply_1q(U1x, psi, n, i)
+    return psi
+
+#This function computes a high-accuracy dense reference evolution for adiabatic dynamics.
+#It uses fine-grained time slicing and exact matrix exponentiation at each step.
+#The result serves as a benchmark for validating approximate simulations.
+
+def simulate_reference_dense(H0: np.ndarray, H1: np.ndarray, T: float, m_ref: int, psi0: np.ndarray) -> np.ndarray:
+    dt = T / m_ref
+    psi = psi0.copy()
+    for k in range(m_ref):
+        t = (k + 0.5) * dt
+        s = t / T
+        Hs = (1.0 - s) * H0 + s * H1
+        U = expm_hermitian(Hs, dt)
+        psi = U @ psi
+    return psi
+
+
+#This helper computes the ℓ2 norm between two statevectors.
+#It provides a simple quantitative measure of simulation error.
+
+def l2_error(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
+
+# ------------********------------
+# ------------********------------ Plot helpers
+# ------------********------------
+#This function plots runtime as a function of adiabatic time slices for different qubit counts.
+#It uses logarithmic scaling on the x-axis to highlight scaling behavior.
+#The figure is saved to disk using a shared plotting helper.
+def plot_runtime_vs_steps(perf_df: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for n, sub in perf_df.groupby("n_qubits"):
+        sub = sub.sort_values("steps")
+        ax.plot(sub["steps"], sub["runtime_sec"], marker="o", label=f"n={n}")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Adiabatic time slices (m)")
+    ax.set_ylabel("Runtime (s)")
+    ax.set_title("Runtime vs time slices (Adiabatic IBM-light)")
+    ax.legend()
+    save_fig(fig, out_path)
+
+#This function visualizes peak memory usage versus adiabatic time slices across system sizes.
+#Logarithmic scaling helps compare memory growth as the number of slices increases.
+#The plot is saved with consistent formatting for reporting.
+
+def plot_memory_vs_steps(perf_df: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for n, sub in perf_df.groupby("n_qubits"):
+        sub = sub.sort_values("steps")
+        ax.plot(sub["steps"], sub["peak_mem_mb"], marker="s", label=f"n={n}")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Adiabatic time slices (m)")
+    ax.set_ylabel("Peak memory (MB)")
+    ax.set_title("Memory vs time slices (Adiabatic IBM-light)")
+    ax.legend()
+    save_fig(fig, out_path)
+
+#This function plots the mean L2 error against the number of adiabatic time slices.
+#Both axes are logarithmic to reveal convergence trends across qubit counts.
+#It highlights the reliability of the adiabatic approximation.
+
+def plot_error_vs_steps(rel_df: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for n, sub in rel_df.groupby("n_qubits"):
+        sub = sub.sort_values("steps")
+        ax.plot(sub["steps"], sub["mean_error"], marker="o", label=f"n={n}")
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xlabel("Adiabatic time slices (m)")
+    ax.set_ylabel("Mean L2 error vs reference")
+    ax.set_title("Reliability: Error vs time slices (ideal)")
+    ax.legend()
+    save_fig(fig, out_path)
+
+#This function generates a heatmap of logarithmic error values over qubit counts and time slices.
+#It aggregates raw errors to provide a global view of accuracy across parameters.
+#Color encoding makes error growth patterns easy to interpret.
+
+def plot_error_heatmap(raw_err: pd.DataFrame, out_path: str) -> None:
+    piv = raw_err.pivot_table(index="n_qubits", columns="steps", values="error", aggfunc="mean")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.imshow(np.log10(piv.values + 1e-16), aspect="auto", origin="lower")
+    ax.set_xticks(range(len(piv.columns))); ax.set_xticklabels(piv.columns)
+    ax.set_yticks(range(len(piv.index)));   ax.set_yticklabels(piv.index)
+    ax.set_xlabel("Adiabatic time slices (m)")
+    ax.set_ylabel("n_qubits")
+    ax.set_title("log10 error: n vs m (ideal)")
+    fig.colorbar(im, ax=ax, label="log10(L2 error)")
+    save_fig(fig, out_path)
+
+#This function plots runtime scalability against Hilbert space dimension for a fixed time-slice budget.
+#It selects the closest available step count to the requested value for robustness.
+#Log–log scaling reveals exponential growth trends with system size.
+
+def plot_scaling_runtime_vs_dim(perf_df: pd.DataFrame, m_for_plot: int, out_path: str) -> None:
+    avail = sorted(perf_df["steps"].unique())
+    m = min(avail, key=lambda x: abs(x - m_for_plot))
+    sub = perf_df[perf_df["steps"] == m].copy()
+    sub["dimension"] = 2 ** sub["n_qubits"]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(sub["dimension"], sub["runtime_sec"], marker="o")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("Hilbert space dimension (2^n)")
+    ax.set_ylabel("Runtime (s)")
+    ax.set_title(f"Scalability: runtime vs dimension (m≈{m}, IBM-light)")
+    save_fig(fig, out_path)
+
+#This function plots runtime scaling versus adiabatic time slices for a fixed number of qubits.
+#It uses logarithmic axes to emphasize computational complexity.
+#The resulting figure helps assess time-discretization costs for a given system size.
+
+def plot_scaling_runtime_vs_steps(perf_df: pd.DataFrame, n_for_plot: int, out_path: str) -> None:
+    sub = perf_df[perf_df["n_qubits"] == n_for_plot].copy().sort_values("steps")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(sub["steps"], sub["runtime_sec"], marker="o")
+    ax.set_xscale("log", base=2); ax.set_yscale("log")
+    ax.set_xlabel("Adiabatic time slices (m)")
+    ax.set_ylabel("Runtime (s)")
+    ax.set_title(f"Scalability: runtime vs time slices (n={n_for_plot}, IBM-light)")
+    save_fig(fig, out_path)
+
+# Carbon plots
+def plot_carbon_distribution(worst_table: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7.5, 6))
+    ax.hist(worst_table["kgCO2e"].values, bins=30)
+    ax.set_xlabel("kg CO2e")
+    ax.set_title("Carbon: Emission distribution")
+    save_fig(fig, out_path)
+
+def plot_carbon_topN(worst_table: pd.DataFrame, N: int, out_path: str) -> None:
+    s = worst_table.sort_values("kgCO2e", ascending=False).head(N)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.barh(s["Country"], s["kgCO2e"])
+    ax.invert_yaxis()
+    ax.set_xlabel("kg CO2e")
+    ax.set_title(f"Carbon: Top {N} countries")
+    save_fig(fig, out_path)
+
+def plot_carbon_median_vs_steps(country_emissions: pd.DataFrame, n_for_plot: int, out_path: str) -> None:
+    sub = country_emissions[country_emissions["n_qubits"] == n_for_plot]
+    med = sub.groupby("steps")["emissions_kgCO2"].median().reset_index()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(med["steps"], med["emissions_kgCO2"], marker="o")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Adiabatic time slices (m)")
+    ax.set_ylabel("Median emissions (kg CO2e)")
+    ax.set_title(f"Median emissions vs time slices (n={n_for_plot})")
+    save_fig(fig, out_path)
+
+# ------------********------------
+# ------------********------------ Carbon helpers
+# ------------********------------
+
+def load_country_co2(path: str, year_select: str = "latest") -> pd.DataFrame:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"CO2 file not found: {path}")
+    df = pd.read_csv(path) if path.lower().endswith(".csv") else pd.read_excel(path)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    cname = next((c for c in df.columns if "country" in c or c in ("name","nation")), None)
+    if cname is None:
+        raise ValueError("No 'country' column found.")
+    yname = next((c for c in df.columns if "year" in c), None)
+
+    cand = [c for c in df.columns if "intensity" in c]
+    if not cand: cand = [c for c in df.columns if ("co2" in c and "kwh" in c)]
+    if not cand: cand = [c for c in df.columns if (("kg" in c or "g" in c) and "kwh" in c)]
+    if not cand:
+        raise ValueError("No intensity column detected.")
+    icol = cand[0]
+
+    cols = [cname, icol] + ([yname] if yname else [])
+    out = df[cols].dropna().copy()
+    out.columns = ["country", "intensity_raw"] + (["year"] if yname else [])
+    out["intensity_raw"] = pd.to_numeric(out["intensity_raw"], errors="coerce")
+    out = out.dropna(subset=["intensity_raw"])
+
+    if np.nanmedian(out["intensity_raw"].values) > 10.0:
+        out["kg_per_kwh"] = out["intensity_raw"] / 1000.0
+    else:
+        out["kg_per_kwh"] = out["intensity_raw"]
+
+    out["country"] = out["country"].astype(str).str.strip().str.title()
+    if yname and year_select == "latest":
+        out = out.sort_values(["country","year"]).groupby("country", as_index=False).tail(1)
+
+    cols_out = ["country", "kg_per_kwh"] + (["year"] if yname else [])
+    return out[cols_out].drop_duplicates()
+
+def compute_emissions(perf_df: pd.DataFrame,
+                      co2_df: pd.DataFrame,
+                      power_watts: float,
+                      pue: float) -> pd.DataFrame:
+    perf = perf_df.copy()
+    perf["energy_kwh"] = (perf["runtime_sec"] * power_watts) / 3.6e6
+    perf["energy_kwh"] *= pue
+    co2 = co2_df.rename(columns={"kg_per_kwh":"kgco2_per_kwh"}).copy()
+    perf["_k"] = 1; co2["_k"] = 1
+    joined = perf.merge(co2, on="_k").drop(columns="_k")
+    joined["emissions_kgCO2"] = joined["energy_kwh"] * joined["kgco2_per_kwh"]
+    return joined
+
+def build_worstcase_country_table(perf_df: pd.DataFrame,
+                                  co2_df: pd.DataFrame,
+                                  power_watts: float,
+                                  pue: float) -> Tuple[pd.DataFrame, dict]:
+    n_heavy = int(perf_df["n_qubits"].max())
+    m_heavy = int(perf_df["steps"].max())
+    mean_runtime_s = float(perf_df[(perf_df["n_qubits"] == n_heavy) &
+                                   (perf_df["steps"] == m_heavy)]["runtime_sec"].mean())
+    energy_kwh = mean_runtime_s * power_watts / 3.6e6 * pue
+
+    tbl = co2_df.copy()
+    if "year" not in tbl.columns:
+        tbl["year"] = pd.NA
+    tbl_out = pd.DataFrame({
+        "Country": tbl["country"].astype(str),
+        "Year": tbl["year"],
+        "Intensity": tbl["kg_per_kwh"],
+        "kWh": energy_kwh,
+    })
+    tbl_out["kgCO2e"] = tbl_out["Intensity"] * tbl_out["kWh"]
+    tbl_out = tbl_out.sort_values("kgCO2e", ascending=False).reset_index(drop=True)
+
+    meta = {
+        "n_heavy": n_heavy,
+        "m_heavy": m_heavy,
+        "mean_runtime_s": mean_runtime_s,
+        "power_watts": power_watts,
+        "pue": pue,
+        "kWh_used": energy_kwh,
+    }
+    return tbl_out, meta
+
+# ------------********------------
+# ------------********------------ Benchmark driver (ideal)
+# ------------********------------
+
+def run_benchmarks(
+    n_list: List[int],
+    m_list: List[int],
+    repeats: int,
+    J: float,
+    h: float,
+    Gamma: float,
+    T: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Ideal adiabatic benchmark:
+      - perf_df: runtime + memory
+      - err_raw: L2 error vs dense reference per (n,m)
+    """
+    perf_rows = []
+    states_by_nm = {}  # (n,m) -> last psi_m
+
+    for n in n_list:
+        psi0 = init_plus_state(n)
+        for m in m_list:
+            for r in range(repeats):
+                tracemalloc.start()
+                t0 = time.perf_counter()
+                psi_m = simulate_adiabatic_gate_noiseless(n, J, h, Gamma, T=T, m_steps=m, psi0=psi0)
+                runtime = time.perf_counter() - t0
+                _, peak = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+
+                perf_rows.append({
+                    "n_qubits": n,
+                    "dimension": 2**n,
+                    "steps": m,
+                    "repeat": r,
+                    "runtime_sec": runtime,
+                    "peak_mem_mb": peak/(1024**2),
+                })
+                states_by_nm[(n,m)] = psi_m  # last state (same for all repeats)
+
+    perf_df = pd.DataFrame(perf_rows)
+
+    # Reliability via dense reference (for each n, all m)
+    err_rows = []
+    for n in n_list:
+        H0, H1 = build_tfim_components_dense(n, J=J, h=h, Gamma=Gamma)
+        psi0 = init_plus_state(n)
+        m_ref = max(m_list) * 4  # higher-resolution reference
+        psi_ref = simulate_reference_dense(H0, H1, T=T, m_ref=m_ref, psi0=psi0)
+        for m in m_list:
+            psi_m = states_by_nm[(n,m)]
+            err_rows.append({
+                "n_qubits": n,
+                "steps": m,
+                "repeat": 0,
+                "error": l2_error(psi_m, psi_ref),
+            })
+
+    err_raw = pd.DataFrame(err_rows)
+    return perf_df, err_raw
+
+def summarize_reliability(err_raw: pd.DataFrame) -> pd.DataFrame:
+    g = err_raw.groupby(["n_qubits","steps"], as_index=False)
+    return g.agg(
+        mean_error=("error","mean"),
+        std_error=("error","std"),
+        max_error=("error","max"),
+        min_error=("error","min"),
+        num_runs=("error","count"),
+    )
+
+def summarize_scalability(perf_df: pd.DataFrame) -> pd.DataFrame:
+    # runtime vs dimension (fixed largest m)
+    m_target = perf_df["steps"].max()
+    sub_dim = perf_df[perf_df["steps"] == m_target].copy()
+    sub_dim["dimension"] = 2 ** sub_dim["n_qubits"]
+    sub_dim = sub_dim.groupby(["n_qubits","dimension"], as_index=False)["runtime_sec"].mean()
+    x = np.log(sub_dim["dimension"].values + 1e-16)
+    y = np.log(sub_dim["runtime_sec"].values + 1e-16)
+    alpha, _ = np.polyfit(x, y, 1)
+
+    # runtime vs steps (fixed largest n)
+    n_target = perf_df["n_qubits"].max()
+    sub_steps = perf_df[perf_df["n_qubits"] == n_target].copy()
+    sub_steps = sub_steps.groupby("steps", as_index=False)["runtime_sec"].mean()
+    xb = np.log(sub_steps["steps"].values + 1e-16)
+    yb = np.log(sub_steps["runtime_sec"].values + 1e-16)
+    beta, _ = np.polyfit(xb, yb, 1)
+
+    return pd.DataFrame({
+        "fit_parameter": ["alpha_dim_scaling","beta_step_scaling"],
+        "estimate": [alpha, beta],
+        "note": [f"Fixed m≈{m_target}", f"Fixed n={n_target}"],
+    })
+
+# ------------********------------
+# ------------********------------ IBM hardware helpers
+# ------------********------------
+
+def build_adiabatic_circuit_ibm(
+    n_qubits: int,
+    J: float,
+    h: float,
+    Gamma: float,
+    T: float,
+    m_steps_hw: int,
+) -> QuantumCircuit:
+    """
+    Gate-based adiabatic circuit mirroring the ideal gate evolution:
+      - RZZ(2*theta_zz), RZ(2*theta_z), RX(2*theta_x) per slice.
+    """
+    qc = QuantumCircuit(n_qubits, n_qubits)
+    m_steps_hw = max(1, int(m_steps_hw))
+    dt = float(T) / float(m_steps_hw)
+
+    for k in range(m_steps_hw):
+        t = (k + 0.5) * dt
+        s = t / T
+        theta_x = dt * (1.0 - s) * Gamma
+        theta_zz = dt * s * J
+        theta_z = dt * s * h
+
+        # even/odd ZZ couplings
+        for i in range(0, n_qubits - 1, 2):
+            qc.rzz(2.0*theta_zz, i, i+1)
+        for i in range(1, n_qubits - 1, 2):
+            qc.rzz(2.0*theta_zz, i, i+1)
+
+        # Z fields
+        for i in range(n_qubits):
+            qc.rz(2.0*theta_z, i)
+
+        # X fields
+        for i in range(n_qubits):
+            qc.rx(2.0*theta_x, i)
+
+    qc.measure(range(n_qubits), range(n_qubits))
+    return qc
+
+def get_ibm_sampler(backend_name: str, shots: int):
+    """
+    Create QiskitRuntimeService backend + SamplerV2 + preset pass manager.
+    Assumes IBM account already saved.
+    """
+    print("[ibm] Initializing QiskitRuntimeService...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = SamplerV2(mode=backend)
+    return backend, sampler, pm
+
+def hardware_adiabatic_single(
+    n_qubits: int,
+    J: float,
+    h: float,
+    Gamma: float,
+    T: float,
+    m_steps_max: int,
+    backend,
+    sampler: SamplerV2,
+    pass_manager,
+    shots: int,
+    hardware_time_slices: int,
+) -> dict:
+    """
+    Run ONE adiabatic circuit on IBM:
+      - n_qubits ≤ backend.num_qubits
+      - m_hw = min(m_steps_max, hardware_time_slices)
+      - returns hardware_runtime_sec, depth, shots, counts_total
+    """
+    if backend.num_qubits < n_qubits:
+        print(f"[adiabatic-ibm-light] WARNING: backend {backend.name} has only "
+              f"{backend.num_qubits} qubits, but n_qubits={n_qubits}. Skipping hardware.")
+        return {
+            "hardware_runtime_sec": 0.0,
+            "hardware_circuit_depth": 0,
+            "hardware_qubits": n_qubits,
+            "hardware_m_hw": 0,
+            "hardware_shots": int(shots),
+            "hardware_counts_total": 0,
+        }
+
+    m_hw = max(1, min(int(m_steps_max), int(hardware_time_slices)))
+    qc = build_adiabatic_circuit_ibm(
+        n_qubits=n_qubits,
+        J=J,
+        h=h,
+        Gamma=Gamma,
+        T=T,
+        m_steps_hw=m_hw,
+    )
+
+    isa_circs = pass_manager.run([qc])
+    depth = isa_circs[0].depth()
+
+    print(f"[adiabatic-ibm-light] Submitting 1 adiabatic circuit (n={n_qubits}, m_hw={m_hw}) to {backend.name}...")
+    t0_hw = time.perf_counter()
+    job = sampler.run(isa_circs, shots=int(shots))
+    primitive_result = job.result()
+    hw_runtime = time.perf_counter() - t0_hw
+    print(f"[adiabatic-ibm-light] Hardware job finished in {hw_runtime:.3f} s.")
+
+    pub_res = primitive_result[0]
+    joined = pub_res.join_data()
+    counts = joined.get_counts()
+    total_counts = sum(counts.values())
+
+    return {
+        "hardware_runtime_sec": float(hw_runtime),
+        "hardware_circuit_depth": int(depth),
+        "hardware_qubits": int(n_qubits),
+        "hardware_m_hw": int(m_hw),
+        "hardware_shots": int(shots),
+        "hardware_counts_total": int(total_counts),
+    }
+
+# ------------********------------
+# ------------********------------ Notebook entry point
+# ------------********------------
+
+def run_adiabatic_ibm_hardware_notebook(
+    n_min: int = 2,
+    n_max: int = 6,
+    steps = (1, 2, 4, 8, 16, 32),
+    repeats: int = 2,
+    J: float = 1.0,
+    h: float = 0.5,
+    Gamma: float = 1.0,
+    T: float = 1.0,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = None,
+    backend_name: str = "ibm_torino",
+    shots: int = 256,
+    hardware_time_slices: int = 8,
+):
+    
+    # ------------********---------------------********----------------------********------------
+    """
+    Run adiabatic benchmarks with IBM hardware in the loop (lightweight).
+
+    Parameters mirror my CLI:
+      - n_min, n_max
+      - steps: can be a tuple (1,2,4,8,16,32) or string "1,2,4,8,16,32"
+      - repeats
+      - J, h, Gamma, T
+      - excel_filename: CO2 intensity file (Desktop by default)
+      - device_power_watts: 65.0
+      - pue: 1.2
+      - year_select: "latest"
+      - outdir: root; inside we create Performance, Scalability, Reliability, Carbon
+      - backend_name, shots, hardware_time_slices: IBM hardware settings
+    """
+    # ------------********---------------------********--------------------********------------
+
+    if n_max < n_min or n_min < 1:
+        raise ValueError("Invalid n range.")
+
+    n_list = list(range(int(n_min), int(n_max) + 1))
+    m_list = _parse_steps_arg(steps)
+    if not m_list:
+        raise ValueError("steps must contain at least one positive integer.")
+
+    print("[adiabatic-ibm-light] Adiabatic IBM hardware benchmark")
+    print("  n_list:", n_list)
+    print("  steps (m_list):", m_list)
+    print(f"  repeats={repeats}, J={J}, h={h}, Gamma={Gamma}, T={T}")
+    print(f"  backend={backend_name}, shots={shots}, hardware_time_slices={hardware_time_slices}")
+    print(f"  CO2 excel_filename={excel_filename}")
+    print(f"  power={device_power_watts} W, PUE={pue}, year_select={year_select}")
+
+    # CO2 path (Desktop search)
+    desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+    defaults = [
+        os.path.join(desktop, "Filtered CO2 intensity 236 Countries.xlsx"),
+        os.path.join(desktop, "Filtered CO2 intensity 236 Countries.csv"),
+    ]
+    co2_path = resolve_desktop_file(excel_filename, defaults)
+    if co2_path is None:
+        print("[WARN] CO2 file not found on Desktop or given path.")
+    else:
+        print(f"[INFO] Using CO2 file: {co2_path}")
+
+    # Output directories
+    if outdir is None:
+        root = os.getcwd()
+    else:
+        root = os.path.abspath(os.path.expandvars(outdir))
+
+    perf_dir = os.path.join(root, "Performance")
+    scal_dir = os.path.join(root, "Scalability")
+    reli_dir = os.path.join(root, "Reliability")
+    carb_dir = os.path.join(root, "Carbon")
+    for d in (perf_dir, scal_dir, reli_dir, carb_dir):
+        ensure_dir(d)
+
+    print("[INFO] Output root:", root)
+    print("      - Performance ->", perf_dir)
+    print("      - Scalability ->", scal_dir)
+    print("      - Reliability ->", reli_dir)
+    print("      - Carbon      ->", carb_dir)
+
+    # Ideal benchmarks
+    print("[INFO] Running ideal adiabatic benchmarks (noiseless)...")
+    t0_all = time.perf_counter()
+    perf_df, err_raw = run_benchmarks(
+        n_list=n_list,
+        m_list=m_list,
+        repeats=int(repeats),
+        J=J,
+        h=h,
+        Gamma=Gamma,
+        T=T,
+    )
+    print(f"[INFO] Ideal benchmarks done in {time.perf_counter() - t0_all:.2f} s")
+
+    # IBM hardware primitives
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+    m_max = max(m_list)
+    hw_metrics_by_n = {}
+
+    for n in n_list:
+        print(f"\n[adiabatic-ibm-light] Running hardware for n={n}, m_max={m_max}")
+        hw_metrics_by_n[n] = hardware_adiabatic_single(
+            n_qubits=n,
+            J=J,
+            h=h,
+            Gamma=Gamma,
+            T=T,
+            m_steps_max=m_max,
+            backend=backend,
+            sampler=sampler,
+            pass_manager=pm,
+            shots=shots,
+            hardware_time_slices=hardware_time_slices,
+        )
+
+    # Merge hardware metrics into perf_df
+    perf_df_ibm = perf_df.copy()
+    perf_df_ibm["hardware_runtime_sec"] = 0.0
+    perf_df_ibm["hardware_circuit_depth"] = 0
+    perf_df_ibm["hardware_qubits"] = perf_df_ibm["n_qubits"]
+    perf_df_ibm["hardware_m_hw"] = 0
+    perf_df_ibm["hardware_shots"] = int(shots)
+    perf_df_ibm["hardware_counts_total"] = 0
+
+    for n in n_list:
+        hw = hw_metrics_by_n.get(n)
+        if hw is None:
+            continue
+        mask_nm = (perf_df_ibm["n_qubits"] == n) & (perf_df_ibm["steps"] == m_max)
+        idx_nm = perf_df_ibm[mask_nm].sort_values("repeat").index.tolist()
+        if not idx_nm:
+            continue
+        first_idx = idx_nm[0]
+        perf_df_ibm.loc[first_idx, "hardware_runtime_sec"] = hw["hardware_runtime_sec"]
+        perf_df_ibm.loc[first_idx, "hardware_circuit_depth"] = hw["hardware_circuit_depth"]
+        perf_df_ibm.loc[first_idx, "hardware_qubits"] = hw["hardware_qubits"]
+        perf_df_ibm.loc[first_idx, "hardware_m_hw"] = hw["hardware_m_hw"]
+        perf_df_ibm.loc[first_idx, "hardware_shots"] = hw["hardware_shots"]
+        perf_df_ibm.loc[first_idx, "hardware_counts_total"] = hw["hardware_counts_total"]
+        # add hardware runtime into total runtime_sec
+        perf_df_ibm.loc[first_idx, "runtime_sec"] = (
+            perf_df_ibm.loc[first_idx, "runtime_sec"] + hw["hardware_runtime_sec"]
+        )
+
+# ------------********-------------- PERFORMANCE -----
+    perf_summary = perf_df_ibm.groupby(["n_qubits","steps"], as_index=False).agg(
+        mean_runtime_sec=("runtime_sec","mean"),
+        std_runtime_sec=("runtime_sec","std"),
+        mean_hw_runtime_sec=("hardware_runtime_sec","mean"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        std_peak_mem_mb=("peak_mem_mb","std"),
+    )
+
+    perf_xlsx = os.path.join(perf_dir, "performance_ibm_hardware.xlsx")
+    write_excel(
+        {"raw": perf_df_ibm.sort_values(["n_qubits","steps","repeat"]),
+         "summary": perf_summary.sort_values(["n_qubits","steps"])},
+        perf_xlsx,
+    )
+    plot_runtime_vs_steps(perf_df_ibm, os.path.join(perf_dir, "runtime_vs_steps_ibm_hardware.png"))
+    plot_memory_vs_steps(perf_df_ibm, os.path.join(perf_dir, "memory_vs_steps_ibm_hardware.png"))
+
+# ------------********-------------- RELIABILITY -----
+    rel_summary = summarize_reliability(err_raw)
+    rel_xlsx = os.path.join(reli_dir, "reliability_ibm_hardware.xlsx")
+    write_excel(
+        {"errors_raw": err_raw.sort_values(["n_qubits","steps","repeat"]),
+         "errors_summary": rel_summary.sort_values(["n_qubits","steps"])},
+        rel_xlsx,
+    )
+    plot_error_vs_steps(rel_summary, os.path.join(reli_dir, "error_vs_steps_ibm_hardware.png"))
+    plot_error_heatmap(err_raw, os.path.join(reli_dir, "error_heatmap_ibm_hardware.png"))
+
+# ------------********-------------- SCALABILITY -----
+    scaling_fit = summarize_scalability(perf_df_ibm)
+    scal_xlsx = os.path.join(scal_dir, "scalability_ibm_hardware.xlsx")
+    write_excel(
+        {"perf_raw": perf_df_ibm.sort_values(["n_qubits","steps","repeat"]),
+         "scaling_fit": scaling_fit},
+        scal_xlsx,
+    )
+    plot_scaling_runtime_vs_dim(
+        perf_df_ibm, m_for_plot=m_max,
+        out_path=os.path.join(scal_dir, "runtime_vs_dimension_loglog_ibm_hardware.png"),
+    )
+    plot_scaling_runtime_vs_steps(
+        perf_df_ibm, n_for_plot=max(n_list),
+        out_path=os.path.join(scal_dir, "runtime_vs_steps_at_largest_n_ibm_hardware.png"),
+    )
+
+# ------------********--------------- CARBON -----
+    carbon_df = None
+    carbon_meta_df = None
+    if co2_path and os.path.isfile(co2_path):
+        co2_df = load_country_co2(co2_path, year_select=year_select)
+        carbon_df = compute_emissions(perf_df_ibm, co2_df,
+                                      power_watts=device_power_watts,
+                                      pue=pue)
+        worst_table, meta = build_worstcase_country_table(perf_df_ibm, co2_df,
+                                                          power_watts=device_power_watts,
+                                                          pue=pue)
+        carb_xlsx = os.path.join(carb_dir, "carbon_footprint_ibm_hardware.xlsx")
+        carbon_meta_df = pd.DataFrame([meta])
+        write_excel(
+            {
+                "co2_by_country": (co2_df.rename(columns={"kg_per_kwh":"kgco2_per_kwh"})
+                                   if "kg_per_kwh" in co2_df.columns else co2_df),
+                "emissions_all": carbon_df.sort_values(["n_qubits","steps","country"]),
+                "worst_case_table": worst_table,
+                "worst_case_metadata": carbon_meta_df,
+            },
+            carb_xlsx,
+        )
+        plot_carbon_distribution(worst_table, os.path.join(carb_dir, "carbon_distribution_ibm_hardware.png"))
+        plot_carbon_topN(worst_table, 15, os.path.join(carb_dir, "carbon_top15_ibm_hardware.png"))
+        plot_carbon_median_vs_steps(
+            carbon_df,
+            n_for_plot=meta["n_heavy"],
+            out_path=os.path.join(carb_dir, "median_emissions_vs_steps_ibm_hardware.png"),
+        )
+    else:
+        placeholder = pd.DataFrame({
+            "note": ["CO2 file not found. Carbon workbook was skipped."],
+            "hint": ["Check excel_filename or place the file on Desktop."],
+        })
+        carb_xlsx = os.path.join(carb_dir, "carbon_placeholder_ibm_hardware.xlsx")
+        write_excel({"info": placeholder}, carb_xlsx)
+
+    print("\n[DONE] Adiabatic IBM hardware benchmark complete.")
+    print(f"Performance Excel:  {perf_xlsx}")
+    print(f"Scalability Excel:  {scal_xlsx}")
+    print(f"Reliability Excel:  {rel_xlsx}")
+    print(f"Carbon Excel:       {os.path.join(carb_dir, 'carbon_footprint_ibm_hardware.xlsx')}")
+    print("Folders under:", root)
+    print("  - Performance")
+    print("  - Scalability")
+    print("  - Reliability")
+    print("  - Carbon")
+
+    return {
+        "perf_df": perf_df_ibm,
+        "err_raw": err_raw,
+        "perf_dir": perf_dir,
+        "scal_dir": scal_dir,
+        "rel_dir": reli_dir,
+        "carb_dir": carb_dir,
+        "carbon_df": carbon_df,
+        "carbon_summary": carbon_meta_df,
+    }

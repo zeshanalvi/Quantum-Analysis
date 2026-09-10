@@ -1,0 +1,7 @@
+python trotter_classical_benchmarks.py ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir "%USERPROFILE%\Desktop\carbon_by_country" ^
+  --combine --workers 4 ^
+  --n-min 2 --n-max 6 --steps "1,2,4,8,16,32" --repeats 2

@@ -1,0 +1,650 @@
+from __future__ import annotations
+
+import os, time, tracemalloc, pathlib, warnings, math
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit import QuantumCircuit
+from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import SamplerV2 as Sampler
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+from IPython.display import display
+
+# ========================= Quantum walk core (same logic as noiseless) =========================
+
+def hadamard_coin():
+    inv = 1.0 / math.sqrt(2.0)
+    return np.array([[inv, inv],
+                     [inv, -inv]], dtype=np.complex128)
+
+def initial_coin_vec_from_seed(seed: int) -> np.ndarray:
+    """
+    Deterministic set of normalized coin states; seed picks one.
+    Keeps 'trials' meaningful while staying noiseless.
+    """
+    H = hadamard_coin()
+    L = np.array([1.0, 0.0], dtype=np.complex128)
+    R = np.array([0.0, 1.0], dtype=np.complex128)
+    plus  = H @ R           # (|L>+|R>)/sqrt2
+    minus = H @ L           # (|L>-|R>)/sqrt2
+    ip    = (L + 1j*R) / math.sqrt(2.0)
+    im    = (L - 1j*R) / math.sqrt(2.0)
+    bank = [L, R, plus, minus, ip, im]
+    return bank[seed % len(bank)]
+
+def apply_coin_all_sites(psi: np.ndarray, H: np.ndarray):
+    """
+    psi shape: (N, 2) complex; apply 2x2 coin to coin subspace at each site.
+    Row-wise multiply by H^T (since rows are site states, columns coin components).
+    """
+    left  = psi[:, 0].copy()
+    right = psi[:, 1].copy()
+    psi[:, 0] = H[0,0]*left + H[1,0]*right
+    psi[:, 1] = H[0,1]*left + H[1,1]*right
+
+def shift_reflecting(psi: np.ndarray):
+    """
+    Reflecting hard-wall shift (unitary permutation):
+      interior: |L,i> -> |L,i-1>, |R,i> -> |R,i+1>
+      left wall:  |L,0>   -> |R,0>
+      right wall: |R,N-1> -> |L,N-1>
+    """
+    N = psi.shape[0]
+    new = np.zeros_like(psi)
+    # interior
+    if N > 1:
+        new[0:N-1, 0] += psi[1:N, 0]      # from i=1..N-1 (L) -> i-1
+        new[1:N,   1] += psi[0:N-1, 1]    # from i=0..N-2 (R) -> i+1
+    # reflections
+    new[0, 1]     += psi[0, 0]            # L at 0 -> R at 0
+    new[N-1, 0]   += psi[N-1, 1]          # R at N-1 -> L at N-1
+    return new
+
+def evolve_iterative(N: int, T: int, seed: int):
+    """
+    Efficient iterative evolution: (H⊗I) then reflecting shift, T times.
+    Returns final psi (N,2).
+    """
+    H = hadamard_coin()
+    psi = np.zeros((N, 2), dtype=np.complex128)
+    pos0 = N // 2
+    psi[pos0, :] = initial_coin_vec_from_seed(seed)
+
+    for _ in range(T):
+        apply_coin_all_sites(psi, H)
+        psi = shift_reflecting(psi)
+    return psi
+
+def build_dense_U(N: int) -> np.ndarray:
+    """
+    Build global step operator U = S @ (C), where
+      C = ⊕_{i=0}^{N-1} H (block-diagonal Hadamard),
+      S = reflecting shift permutation in the {|L,i>, |R,i>} basis.
+    Basis ordering: [(L,0),(R,0),(L,1),(R,1),..., (L,N-1),(R,N-1)]
+    """
+    H = hadamard_coin()
+    d = 2 * N
+    C = np.zeros((d, d), dtype=np.complex128)
+    for i in range(N):
+        C[2*i:2*i+2, 2*i:2*i+2] = H
+
+    S = np.zeros((d, d), dtype=np.complex128)
+
+    def idx(i, coin):  # coin 0=L, 1=R
+        return 2*i + coin
+
+    # interior shifts
+    for i in range(1, N):      # L,i -> L,i-1
+        S[idx(i-1, 0), idx(i, 0)] = 1.0
+    for i in range(0, N-1):    # R,i -> R,i+1
+        S[idx(i+1, 1), idx(i, 1)] = 1.0
+
+    # reflections
+    S[idx(0,   1), idx(0,   0)] = 1.0      # L,0 -> R,0
+    S[idx(N-1, 0), idx(N-1, 1)] = 1.0      # R,N-1 -> L,N-1
+
+    U = S @ C
+    return U
+
+def evolve_dense_reference(N: int, T: int, seed: int, U: np.ndarray):
+    """
+    Reference evolution using dense unitary U: psi <- U^T psi.
+    """
+    d = 2 * N
+    psi = np.zeros(d, dtype=np.complex128)
+    pos0 = N // 2
+    coin = initial_coin_vec_from_seed(seed)   # [L,R]
+    psi[2*pos0:2*pos0+2] = coin
+    for _ in range(T):
+        psi = U @ psi
+    return psi.reshape(N, 2)
+
+def position_marginal(psi: np.ndarray) -> np.ndarray:
+    """Return p[i] = |psi_L(i)|^2 + |psi_R(i)|^2."""
+    return (np.abs(psi[:, 0])**2 + np.abs(psi[:, 1])**2).astype(np.float64)
+
+# ========================= Metrics =========================
+
+def tv_distance(p: np.ndarray, q: np.ndarray) -> float:
+    return 0.5 * float(np.abs(p - q).sum())
+
+# ========================= Tiny hardware probe circuit =========================
+
+def hardware_probe_circuit(sampler: Sampler, pass_manager, shots: int) -> None:
+    """
+    Very small circuit run on real IBM hardware to capture QPU runtime/overhead.
+
+    This does NOT implement the full quantum walk (which would be deep),
+    but keeps the hardware workload light while the walk itself is computed
+    exactly as in the noiseless baseline.
+    """
+    qc = QuantumCircuit(1)
+    rng = np.random.default_rng()
+    qc.h(0)
+    qc.ry(float(rng.random() * 2 * np.pi), 0)
+    qc.measure_all()
+
+    isa_qc = pass_manager.run(qc)
+    job = sampler.run([isa_qc], shots=shots)
+    _ = job.result()  # we ignore the contents; we just trigger a real backend execution
+
+# ========================= One quantum-walk experiment on "hardware" =========================
+
+def run_qwalk_single_hardware(
+    N: int,
+    T: int,
+    tv_tol: float,
+    seed: int,
+    U_cache: dict,
+    sampler: Sampler,
+    pass_manager,
+    shots: int,
+) -> Dict:
+    """
+    One experiment:
+
+      1) Evolve the walk iteratively (H+shift) for T steps (same as noiseless).
+      2) Evolve via dense reference U^T (same as noiseless).
+      3) Compare position marginals via TV distance; mark success if TV <= tv_tol.
+      4) Run a tiny hardware probe circuit via SamplerV2.
+      5) Measure wall-clock runtime & Python peak memory.
+    """
+    if N not in U_cache:
+        U_cache[N] = build_dense_U(N)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    psi_iter = evolve_iterative(N, T, seed)
+    psi_ref  = evolve_dense_reference(N, T, seed, U_cache[N])
+
+    p_iter = position_marginal(psi_iter)
+    p_ref  = position_marginal(psi_ref)
+
+    tv = tv_distance(p_iter, p_ref)
+    success = bool(tv <= tv_tol)
+
+    # tiny hardware probe (low-resource)
+    hardware_probe_circuit(sampler, pass_manager, shots=shots)
+
+    runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return {
+        "n": int(N),
+        "steps": int(T),
+        "seed": int(seed),
+        "tv_distance": float(tv),
+        "success": success,
+        "runtime_s": float(runtime),
+        "peak_mem_mb": float(peak / (1024**2)),
+        "shots": int(shots),
+    }
+
+# ========================= CO2 / Carbon utilities =========================
+
+def _resolve_carbon_path_notebook(excel_name: str | None) -> str:
+    """
+    Try to locate the CO2 intensity file for the notebook.
+
+    Priority:
+      1) If excel_name is an existing path (absolute or relative), use it.
+      2) If excel_name is given but not a path, try Desktop/excel_name.
+      3) Otherwise, try standard Desktop names:
+           - Filtered_CO2_intensity_236_Countries.csv
+           - Filtered CO2 intensity 236 Countries.xlsx
+    """
+    desktop = pathlib.Path.home() / "Desktop"
+
+    if excel_name:
+        p = pathlib.Path(excel_name)
+        if p.exists():
+            return str(p.resolve())
+        d = desktop / p.name
+        if d.exists():
+            return str(d.resolve())
+
+    candidates = [
+        desktop / "Filtered_CO2_intensity_236_Countries.csv",
+        desktop / "Filtered CO2 intensity 236 Countries.xlsx",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c.resolve())
+
+    return excel_name or "Filtered CO2 intensity 236 Countries.xlsx"
+
+
+def load_carbon_table(path: str, year_select: str = "latest") -> pd.DataFrame:
+    """
+    Load CO2 intensity data from CSV or Excel and keep the latest year per country.
+
+    Automatically detects:
+      - Country column (contains 'country', 'nation', or 'location')
+      - Year column (contains 'year' or 'date') – optional
+      - Intensity column (contains 'intensity', or 'co2' with 'kwh'/'/kwh', 'kgco2', 'gco2')
+        If not found, uses the first numeric column (excluding year).
+
+    If intensities look like gCO2/kWh (median > 50), convert to kgCO2/kWh.
+    """
+    p = pathlib.Path(path)
+    suffix = p.suffix.lower()
+
+    if suffix in [".csv", ".txt"]:
+        df = pd.read_csv(p)
+    else:
+        df = pd.read_excel(p)
+
+    cols = {c.lower(): c for c in df.columns}
+
+    cand_country = next(
+        (v for k, v in cols.items()
+         if "country" in k or "nation" in k or k == "location"),
+        None,
+    )
+    if cand_country is None:
+        raise ValueError("No 'Country' column found in CO2 file.")
+
+    cand_year = next(
+        (v for k, v in cols.items() if "year" in k or "date" in k),
+        None,
+    )
+    cand_intensity = next(
+        (v for k, v in cols.items()
+         if "intensity" in k
+         or ("co2" in k and ("kwh" in k or "/kwh" in k))
+         or "kgco2" in k
+         or "gco2" in k),
+        None,
+    )
+
+    if cand_intensity is None:
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if cand_year in numeric_cols:
+            numeric_cols.remove(cand_year)
+        if not numeric_cols:
+            raise ValueError("No numeric intensity column detected in CO2 file.")
+        cand_intensity = numeric_cols[0]
+
+    keep = [cand_country] + ([cand_year] if cand_year else []) + [cand_intensity]
+    df = df[keep].copy()
+    df.columns = ["Country", "Year", "Intensity"] if len(keep) == 3 else ["Country", "Intensity"]
+
+    if "Year" in df.columns and year_select.lower() == "latest":
+        df = (
+            df.sort_values(["Country", "Year"])
+              .groupby("Country", as_index=False)
+              .tail(1)
+        )
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0  # gCO2/kWh -> kgCO2/kWh
+
+    return df.dropna(subset=["Country", "Intensity"]).reset_index(drop=True)
+
+
+def compute_carbon(
+    perf_df: pd.DataFrame,
+    intensity_df: pd.DataFrame,
+    device_power_watts: float,
+    pue: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute country-wise kgCO2e using total runtime from PERFORMANCE experiments.
+
+      E_total (kWh) = power(W) * PUE * total_runtime_s / 3.6e6
+      CO2(country)  = intensity(country) [kg/kWh] * E_total
+    """
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = device_power_watts * pue * total_runtime_s / 3_600_000.0
+
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "device_power_watts": [device_power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ========================= Plotting helpers =========================
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+def plot_performance_qwalk(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["runtime_s"], marker="o")
+    plt.title("Quantum Walk Performance: Runtime vs N (hardware)")
+    plt.xlabel("N (positions)")
+    plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "qwalk_perf_runtime_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("n")["tv_distance"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["n"], g2["tv_distance"], marker="s")
+    plt.title("Quantum Walk Performance: Mean TV distance vs N (hardware)")
+    plt.xlabel("N (positions)")
+    plt.ylabel("TV distance")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "qwalk_perf_tv_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+def plot_scalability_qwalk(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.loglog(g["n"], g["runtime_s"], marker="o")
+    plt.title("Quantum Walk Scalability: Runtime (log–log, hardware)")
+    plt.xlabel("N (positions)")
+    plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "qwalk_scal_loglog_runtime_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("n")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["n"], g2["peak_mem_mb"], marker="^")
+    plt.title("Quantum Walk Scalability: Peak memory vs N (hardware)")
+    plt.xlabel("N (positions)")
+    plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "qwalk_scal_peakmem_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+def plot_reliability_qwalk(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["success"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["success"], marker="o")
+    plt.ylim(0, 1.05)
+    plt.title("Quantum Walk Reliability: Success rate vs N (hardware)")
+    plt.xlabel("N (positions)")
+    plt.ylabel("Success rate (TV ≤ tol)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "qwalk_rel_success_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    data = [df[df["n"] == k]["tv_distance"].values for k in sorted(df["n"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["n"].unique()))
+    plt.title("Quantum Walk Reliability: TV distance distribution (hardware)")
+    plt.xlabel("N (positions)")
+    plt.ylabel("TV distance")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "qwalk_rel_tv_boxplot.png"), **plt_kwargs)
+    plt.close()
+
+def plot_carbon_qwalk(df: pd.DataFrame, outdir: str):
+    top = df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8, 5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Quantum Walk Carbon: Top 15 countries (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "qwalk_carbon_top15.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(df["kgCO2e"], bins=30)
+    plt.title("Quantum Walk Carbon: Emission distribution (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "qwalk_carbon_distribution.png"), **plt_kwargs)
+    plt.close()
+
+    xs = np.sort(df["kgCO2e"].values)
+    ys = np.arange(1, len(xs) + 1) / len(xs)
+    plt.figure()
+    plt.plot(xs, ys)
+    plt.title("Quantum Walk Carbon: CDF across countries (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.ylabel("CDF")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "qwalk_carbon_cdf.png"), **plt_kwargs)
+    plt.close()
+
+# ========================= Notebook main entry =========================
+
+def run_qwalk_ibm_hardware_notebook(
+    sizes=(21,),                  # positions N (odd recommended)
+    steps=1000,                   # time steps T
+    trials=10,                    # trials per N (different seeds)
+    tv_tol=1e-12,                 # TV threshold for success
+    backend_name=None,            # e.g. "ibm_torino"; if None, first non-simulator
+    shots=256,                    # shots for tiny probe circuit
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country_qwalk",
+):
+    """
+    Notebook-style Quantum Walk benchmark on real IBM hardware.
+
+    Mirrors the noiseless script:
+
+      1) Performance   – runtime, peak memory, TV distance
+      2) Scalability   – runtime (log–log) vs N, peak memory vs N
+      3) Reliability   – success rate (TV<=tol), TV dispersion across seeds
+      4) Carbon        – CO2 based on PERFORMANCE runtimes only
+
+    Outputs on Desktop:
+      Desktop/Performance
+      Desktop/Scalability
+      Desktop/Reliability
+      Desktop/Carbon footprints/<outdir>/
+    """
+    sizes = sorted(set(int(N) for N in sizes))
+
+    # Desktop output folders
+    desktop = pathlib.Path.home() / "Desktop"
+    perf_dir = desktop / "Performance"
+    scal_dir = desktop / "Scalability"
+    rel_dir  = desktop / "Reliability"
+    carb_root = desktop / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # ---- Connect to IBM hardware ----
+    print("[ibm] Initializing QiskitRuntimeService (assuming account is saved)...")
+    service = QiskitRuntimeService()
+
+    if backend_name is not None:
+        backend = service.backend(backend_name)
+    else:
+        backends = service.backends()
+        real_qpus = [b for b in backends if not getattr(b, "simulator", False)]
+        if not real_qpus:
+            raise RuntimeError("No non-simulator IBM backends found for this account.")
+        backend = real_qpus[0]
+        backend_name = backend.name
+
+    print(f"[ibm] Using backend: {backend_name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per probe circuit: {shots}")
+    print("[run] sizes:", sizes, "| steps:", steps, "| trials per size:", trials)
+
+    # Transpiler pass manager & SamplerV2
+    pass_manager = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = Sampler(mode=backend)
+    try:
+        sampler.options.default_shots = shots
+    except Exception:
+        pass
+
+    # ---- Run experiments ----
+    U_cache: Dict[int, np.ndarray] = {}
+    rows: List[Dict] = []
+
+    for N in sizes:
+        for i in range(trials):
+            seed = 1000 + 17 * N + i   # same pattern as noiseless script
+            res = run_qwalk_single_hardware(
+                N=N,
+                T=steps,
+                tv_tol=tv_tol,
+                seed=seed,
+                U_cache=U_cache,
+                sampler=sampler,
+                pass_manager=pass_manager,
+                shots=shots,
+            )
+            rows.append(res)
+            print(
+                f"  - N={res['n']} seed={res['seed']} TV={res['tv_distance']:.2e} "
+                f"runtime={res['runtime_s']:.4f}s success={int(res['success'])}"
+            )
+
+    df = pd.DataFrame(rows)
+
+    # ====================== Performance ======================
+    perf_path = perf_dir / "performance_qwalk_hardware.xlsx"
+    perf_agg = (
+        df.groupby("n")
+          .agg(
+              mean_runtime_s=("runtime_s", "mean"),
+              mean_peak_mem_mb=("peak_mem_mb", "mean"),
+              mean_tv_distance=("tv_distance", "mean"),
+              success_rate=("success", "mean"),
+          )
+          .reset_index()
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_path, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance_qwalk(df, str(perf_dir))
+
+    # ====================== Scalability ======================
+    scal_path = scal_dir / "scalability_qwalk_hardware.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_path, engine="openpyxl") as w:
+            df[["n", "runtime_s", "peak_mem_mb"]].to_excel(
+                w, index=False, sheet_name="raw"
+            )
+            df.groupby("n").mean(numeric_only=True).reset_index().to_excel(
+                w, index=False, sheet_name="aggregated"
+            )
+
+    plot_scalability_qwalk(df, str(scal_dir))
+
+    # ====================== Reliability ======================
+    rel_path = rel_dir / "reliability_qwalk_hardware.xlsx"
+    rel_agg = (
+        df.groupby("n")
+          .agg(
+              success_rate=("success", "mean"),
+              mean_tv=("tv_distance", "mean"),
+              std_tv=("tv_distance", "std"),
+          )
+          .reset_index()
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_path, engine="openpyxl") as w:
+            df[["n", "seed", "tv_distance", "success"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability_qwalk(df, str(rel_dir))
+
+    # ====================== Carbon footprint ======================
+    excel_path = _resolve_carbon_path_notebook(excel_filename)
+    print(f"[carbon] Using CO2 file: {excel_path}")
+
+    carbon_df = pd.DataFrame()
+    summary_df = pd.DataFrame()
+
+    try:
+        intensity_df = load_carbon_table(excel_path, year_select=year_select)
+        carbon_df, summary_df = compute_carbon(
+            perf_df=df,
+            intensity_df=intensity_df,
+            device_power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_path = carb_dir / "carbon_qwalk_hardware.xlsx"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_path, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input_latest")
+
+        plot_carbon_qwalk(carbon_df, str(carb_dir))
+        print(f"[carbon] Results saved to {carb_path}")
+    except Exception as e:
+        print(f"[carbon] Failed to compute carbon footprint: {e}")
+
+    print("\n=== Quantum Walk hardware summary ===")
+    print(f"Performance Excel → {perf_path}")
+    print(f"Scalability Excel → {scal_path}")
+    print(f"Reliability Excel → {rel_path}")
+    print(f"Carbon folder     → {carb_dir}")
+
+    if not carbon_df.empty:
+        print("\n[carbon] Country-wise CO2 (latest year per country):")
+        display(carbon_df.head(10))
+
+    return {
+        "df": df,
+        "carbon_df": carbon_df,
+        "summary_df": summary_df,
+        "backend_name": backend_name,
+        "folders": {
+            "performance": perf_dir,
+            "scalability": scal_dir,
+            "reliability": rel_dir,
+            "carbon": carb_dir,
+        },
+    }

@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+#  Deutsch Jozsa Algorithm on Real IBM Hardware
+
+# ----------------------------------------------------------------------------------------------------------------
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports
+#This code section imports standard libraries for file handling, timing, memory tracking, and numerical computations.
+#It sets up data analysis and plotting tools, configuring matplotlib for non-interactive environments.
+#It imports Qiskit components required for building, running, and visualizing quantum circuits and results.
+
+from __future__ import annotations
+
+import os, time, tracemalloc, pathlib, warnings, math
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")  
+import matplotlib.pyplot as plt
+
+from qiskit import QuantumCircuit
+from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import SamplerV2 as Sampler
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+from IPython.display import display
+
+# ------------********------------ Helper: extract counts from SamplerV2 result
+
+#def _extract_counts_from_pub_result()  retrieves measurement outcome counts from a SamplerV2 public result.
+#It attempts several known result attributes to remain compatible with different sampler data layouts.
+#It raises an error if no measurement counts can be successfully extracted.
+
+def _extract_counts_from_pub_result(pub_result):
+    """
+    Extract combined counts from SamplerV2 PubResult.
+    Prefers data.meas.get_counts() or data.c.get_counts().
+    """
+    data = pub_result.data
+
+    if hasattr(data, "meas") and hasattr(data.meas, "get_counts"):
+        return dict(data.meas.get_counts())
+    if hasattr(data, "c") and hasattr(data.c, "get_counts"):
+        return dict(data.c.get_counts())
+
+    for name in dir(data):
+        if name.startswith("_"):
+            continue
+        reg = getattr(data, name)
+        if hasattr(reg, "get_counts"):
+            try:
+                return dict(reg.get_counts())
+            except Exception:
+                pass
+
+    raise RuntimeError("Could not extract counts from sampler result.")
+
+# ------------********------------ Deutsch–Jozsa hardware core 
+
+def build_dj_phase_oracle_circuit(
+    n: int,
+    rng: np.random.Generator,
+    oracle_type: str,
+) -> Tuple[QuantumCircuit, str]:
+    """
+    Build a Deutsch–Jozsa phase-oracle circuit on n qubits:
+
+      |0^n> --H^n-- oracle_phase --H^n-- measure
+
+    Oracles (matching noiseless script semantics):
+      - CONSTANT: f(x) ≡ c ∈ {0,1}; global phase (-1)^c, which is physically irrelevant.
+      - BALANCED: parity family f_s(x) = s·x (mod 2) with random non-zero s.
+                  Implemented via Z on qubits where s_i=1, after first H-layer.
+
+    Returns: (QuantumCircuit, true_label) where true_label is "CONSTANT" or "BALANCED".
+    """
+    qc = QuantumCircuit(n)
+
+    # Initial H-layer
+    for q in range(n):
+        qc.h(q)
+
+    if oracle_type == "CONSTANT":
+        # Choose random c, but global phase does not affect measurement => identity is enough.
+        _c = int(rng.integers(0, 2))
+        true_label = "CONSTANT"
+        # If you really want, you can set a global phase, but it's not observable:
+        # if _c == 1:
+        #     qc.global_phase = qc.global_phase + np.pi
+    elif oracle_type == "BALANCED":
+        # Random non-zero s ∈ {0,1}^n
+        s = np.zeros(n, dtype=np.uint8)
+        while not s.any():
+            s = rng.integers(0, 2, size=n, dtype=np.uint8)
+        for i in range(n):
+            if s[i]:
+                qc.z(i)
+        true_label = "BALANCED"
+    else:
+        raise ValueError("oracle_type must be 'CONSTANT' or 'BALANCED'.")
+
+    # Final H-layer
+    for q in range(n):
+        qc.h(q)
+
+    # Measure all qubits
+    qc.measure_all()
+
+    return qc, true_label
+
+
+def run_dj_single_hardware(
+    n: int,
+    seed: int,
+    oracle_type: str,
+    sampler: Sampler,
+    pass_manager,
+    shots: int,
+) -> Dict:
+    """
+    Single Deutsch–Jozsa run on real IBM hardware (via SamplerV2).
+
+    Steps:
+      1) For given n, seed, oracle_type, fix the oracle (CONSTANT or BALANCED parity).
+      2) Build DJ circuit |0^n> -> H^n -> oracle -> H^n -> measure.
+      3) Transpile to backend via generate_preset_pass_manager.
+      4) Execute via SamplerV2 (with given shots).
+      5) Classify:
+         - Let p_zero = Pr[ measurement = 0^n ].
+         - Predict CONSTANT if p_zero > 0.5, else BALANCED.
+      6) Measure runtime (wall-clock) and peak Python memory (tracemalloc).
+    """
+    rng = np.random.default_rng(seed)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    qc, true_label = build_dj_phase_oracle_circuit(n, rng, oracle_type)
+    isa_qc = pass_manager.run(qc)
+
+    print(f"[hardware] DJ run: n={n}, seed={seed}, oracle={oracle_type}, shots={shots}")
+    job = sampler.run([isa_qc], shots=shots)
+    result = job.result()
+    pub = result[0]
+    counts = _extract_counts_from_pub_result(pub)
+
+    runtime = time.perf_counter() - t0
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    zero_str = "0" * n
+    zero_count = counts.get(zero_str, 0)
+    total_shots = sum(counts.values()) or 1
+    p_zero = zero_count / total_shots
+
+    pred_label = "CONSTANT" if p_zero > 0.5 else "BALANCED"
+    correct = (pred_label == true_label)
+
+    return {
+        "n": int(n),
+        "seed": int(seed),
+        "oracle": true_label,
+        "prediction": pred_label,
+        "correct": bool(correct),
+        "queries_used": 1,  # DJ uses exactly 1 oracle query
+        "runtime_s": float(runtime),
+        "peak_mem_mb": float(peak / (1024 ** 2)),
+        "shots": int(shots),
+    }
+
+# ------------********------------ CO2 / Carbon utilities 
+
+def _resolve_carbon_path_notebook(excel_name: str | None) -> str:
+    """
+    Try to locate the CO2 intensity file for the notebook.
+
+    Priority:
+      1) If excel_name is an existing path (absolute or relative), use it.
+      2) If excel_name is given but not a path, try Desktop/excel_name.
+      3) Otherwise, try standard Desktop names:
+           - Filtered_CO2_intensity_236_Countries.csv
+           - Filtered CO2 intensity 236 Countries.xlsx
+    """
+    desktop = pathlib.Path.home() / "Desktop"
+
+    if excel_name:
+        p = pathlib.Path(excel_name)
+        if p.exists():
+            return str(p.resolve())
+        d = desktop / p.name
+        if d.exists():
+            return str(d.resolve())
+
+    candidates = [
+        desktop / "Filtered_CO2_intensity_236_Countries.csv",
+        desktop / "Filtered CO2 intensity 236 Countries.xlsx",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c.resolve())
+
+    # Fall back to given name; load step will error clearly if not found
+    return excel_name or "Filtered CO2 intensity 236 Countries.xlsx"
+
+
+def load_carbon_table(path: str, year_select: str = "latest") -> pd.DataFrame:
+    """
+    Load CO2 intensity data from CSV or Excel and keep the latest year per country.
+
+    Automatically detects:
+      - Country column (contains 'country', 'nation', or 'location')
+      - Year column (contains 'year' or 'date') – optional
+      - Intensity column (contains 'intensity', or 'co2' with 'kwh'/'/kwh', 'kgco2', 'gco2')
+        If not found, uses the first numeric column (excluding year).
+
+    If intensities look like gCO2/kWh (median > 50), convert to kgCO2/kWh.
+    """
+    p = pathlib.Path(path)
+    suffix = p.suffix.lower()
+
+    if suffix in [".csv", ".txt"]:
+        df = pd.read_csv(p)
+    else:
+        df = pd.read_excel(p)
+
+    cols = {c.lower(): c for c in df.columns}
+
+    cand_country = next(
+        (v for k, v in cols.items()
+         if "country" in k or "nation" in k or k == "location"),
+        None,
+    )
+    if cand_country is None:
+        raise ValueError("No 'Country' column found in CO2 file.")
+
+    cand_year = next(
+        (v for k, v in cols.items() if "year" in k or "date" in k),
+        None,
+    )
+    cand_intensity = next(
+        (v for k, v in cols.items()
+         if "intensity" in k
+         or ("co2" in k and ("kwh" in k or "/kwh" in k))
+         or "kgco2" in k
+         or "gco2" in k),
+        None,
+    )
+
+    if cand_intensity is None:
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if cand_year in numeric_cols:
+            numeric_cols.remove(cand_year)
+        if not numeric_cols:
+            raise ValueError("No numeric intensity column detected in CO2 file.")
+        cand_intensity = numeric_cols[0]
+
+    keep = [cand_country] + ([cand_year] if cand_year else []) + [cand_intensity]
+    df = df[keep].copy()
+    df.columns = ["Country", "Year", "Intensity"] if len(keep) == 3 else ["Country", "Intensity"]
+
+    if "Year" in df.columns and year_select.lower() == "latest":
+        df = (
+            df.sort_values(["Country", "Year"])
+              .groupby("Country", as_index=False)
+              .tail(1)
+        )
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0  # gCO2/kWh → kgCO2/kWh
+
+    return df.dropna(subset=["Country", "Intensity"]).reset_index(drop=True)
+
+
+def compute_carbon(
+    perf_df: pd.DataFrame,
+    intensity_df: pd.DataFrame,
+    device_power_watts: float,
+    pue: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute country-wise kgCO2e using total runtime from PERFORMANCE experiments.
+
+      E_total (kWh) = power(W) * PUE * total_runtime_s / 3.6e6
+      CO2(country)  = intensity(country) [kg/kWh] * E_total
+    """
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = device_power_watts * pue * total_runtime_s / 3_600_000.0
+
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "device_power_watts": [device_power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ------------********------------ Plot helpers =========================
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+# ------------********------------
+def plot_performance_dj(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["runtime_s"], marker="o")
+    plt.title("DJ Performance: Runtime vs n (hardware)")
+    plt.xlabel("n (input bits)")
+    plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_perf_runtime_vs_n.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("n")["queries_used"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["n"], g2["queries_used"], marker="s")
+    plt.title("DJ Performance: Mean queries vs n (hardware)")
+    plt.xlabel("n (input bits)")
+    plt.ylabel("Mean queries used")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_perf_queries_vs_n.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_scalability_dj(df: pd.DataFrame, outdir: str):
+    plt.figure()
+    plt.loglog(df["queries_used"], df["runtime_s"], "o", alpha=0.5)
+    plt.title("DJ Scalability: Runtime vs queries (log–log, hardware)")
+    plt.xlabel("Queries used")
+    plt.ylabel("Runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_scal_loglog_runtime_vs_queries.png"), **plt_kwargs)
+    plt.close()
+
+    g = df.groupby("n")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["peak_mem_mb"], marker="^")
+    plt.title("DJ Scalability: Peak memory vs n (hardware)")
+    plt.xlabel("n (input bits)")
+    plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_scal_peakmem_vs_n.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_reliability_dj(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["correct"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["correct"], marker="o")
+    plt.ylim(0, 1.05)
+    plt.title("DJ Reliability: Success rate vs n (hardware)")
+    plt.xlabel("n (input bits)")
+    plt.ylabel("Success rate")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_rel_success_vs_n.png"), **plt_kwargs)
+    plt.close()
+
+    data = [df[df["n"] == k]["queries_used"].values for k in sorted(df["n"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["n"].unique()))
+    plt.title("DJ Reliability: Queries distribution by n (hardware)")
+    plt.xlabel("n (input bits)")
+    plt.ylabel("Queries used")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_rel_queries_boxplot.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("n")["queries_used"].agg(["mean", "std"]).reset_index()
+    plt.figure()
+    plt.errorbar(g2["n"], g2["mean"], yerr=g2["std"], fmt="-s")
+    plt.title("DJ Reliability: Mean±Std of queries vs n (hardware)")
+    plt.xlabel("n (input bits)")
+    plt.ylabel("Queries used")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_rel_queries_mean_std.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_carbon_dj(df: pd.DataFrame, outdir: str):
+    top = df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8, 5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("DJ Carbon: Top 15 countries (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "dj_carbon_top15.png"), **plt_kwargs)
+    plt.close()
+
+    bot = df.nsmallest(15, "kgCO2e")
+    plt.figure(figsize=(8, 5))
+    plt.barh(bot["Country"][::-1], bot["kgCO2e"][::-1])
+    plt.title("DJ Carbon: Bottom 15 countries (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "dj_carbon_bottom15.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(df["kgCO2e"], bins=30)
+    plt.title("DJ Carbon: Emission distribution (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_carbon_distribution.png"), **plt_kwargs)
+    plt.close()
+
+    xs = np.sort(df["kgCO2e"].values)
+    ys = np.arange(1, len(xs) + 1) / len(xs)
+    plt.figure()
+    plt.plot(xs, ys)
+    plt.title("DJ Carbon: CDF of emissions (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.ylabel("CDF")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "dj_carbon_cdf.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------ Notebook main entry =========================
+#def run_dj_ibm_hardware_notebook defines the interface for running Deutsch–Jozsa experiments on
+#    IBM quantum hardware within a notebook.
+#It exposes configurable parameters for problem sizes, trials, backend selection, shots, and carbon analysis settings.
+#It prepares defaults suitable for practical hardware execution and result export.
+
+def run_dj_ibm_hardware_notebook(
+    sizes=(6, 8, 10, 12),       # 
+    trials=10,                  # trials per (n, oracle_type)
+    backend_name=None,          # e.g. "ibm_torino"; if None, first non-simulator
+    shots=256,                  # shots per DJ circuit (keep small)
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country_dj",
+):
+    """
+    Notebook-style Deutsch–Jozsa benchmark on real IBM hardware.
+    Outputs (on Desktop):
+      Desktop/Performance
+      Desktop/Scalability
+      Desktop/Reliability
+      Desktop/Carbon footprints/<outdir>/
+
+    Returns a dict with:
+      - 'df'          : raw results DataFrame
+      - 'carbon_df'   : per-country CO2 table
+      - 'summary_df'  : CO2 summary (runtime, kWh, etc.)
+      - 'backend_name': name of backend used
+      - 'folders'     : dict of output folder paths
+    """
+
+    sizes = sorted(set(int(n) for n in sizes))
+
+    # Desktop output folders
+    desktop = pathlib.Path.home() / "Desktop"
+    perf_dir = desktop / "Performance"
+    scal_dir = desktop / "Scalability"
+    rel_dir  = desktop / "Reliability"
+    carb_root = desktop / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # ------------********------------ Connect to IBM hardware ----
+    print("[ibm] Initializing QiskitRuntimeService (assuming account is saved)...")
+    service = QiskitRuntimeService()
+
+    if backend_name is not None:
+        backend = service.backend(backend_name)
+    else:
+        backends = service.backends()
+        real_qpus = [b for b in backends if not getattr(b, "simulator", False)]
+        if not real_qpus:
+            raise RuntimeError("No non-simulator IBM backends found for this account.")
+        backend = real_qpus[0]
+        backend_name = backend.name
+
+    print(f"[ibm] Using backend: {backend_name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per DJ circuit: {shots}")
+    print("[run] sizes:", sizes, "| trials per size:", trials)
+
+    # Transpiler pass manager & SamplerV2 for this backend
+    pass_manager = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = Sampler(mode=backend)
+    try:
+        sampler.options.default_shots = shots
+    except Exception:
+        pass
+
+    # ---- Run DJ experiments (matching noiseless seed pattern) ----
+    rows: List[Dict] = []
+    for n in sizes:
+        for i in range(trials):
+            # CONSTANT oracle
+            seed_c = 1000 + 17 * n + i
+            res_c = run_dj_single_hardware(
+                n=n,
+                seed=seed_c,
+                oracle_type="CONSTANT",
+                sampler=sampler,
+                pass_manager=pass_manager,
+                shots=shots,
+            )
+            rows.append(res_c)
+            print(f"  - DJ CONSTANT n={n}, seed={seed_c}, correct={int(res_c['correct'])}")
+
+            # BALANCED oracle
+            seed_b = 2000 + 17 * n + i
+            res_b = run_dj_single_hardware(
+                n=n,
+                seed=seed_b,
+                oracle_type="BALANCED",
+                sampler=sampler,
+                pass_manager=pass_manager,
+                shots=shots,
+            )
+            rows.append(res_b)
+            print(f"  - DJ BALANCED n={n}, seed={seed_b}, correct={int(res_b['correct'])}")
+
+    df = pd.DataFrame(rows)
+
+    # ------------********------------ Performance ======================
+    perf_path = perf_dir / "performance_dj_hardware.xlsx"
+    perf_agg = (
+        df.groupby("n")
+          .agg(
+              mean_runtime_s=("runtime_s", "mean"),
+              mean_queries=("queries_used", "mean"),
+              mean_peak_mem_mb=("peak_mem_mb", "mean"),
+          )
+          .reset_index()
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_path, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance_dj(df, str(perf_dir))
+
+    # ------------********------------ Scalability ======================
+    scal_path = scal_dir / "scalability_dj_hardware.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_path, engine="openpyxl") as w:
+            df[["n", "oracle", "queries_used", "runtime_s", "peak_mem_mb"]].to_excel(
+                w, index=False, sheet_name="raw"
+            )
+            df.groupby(["n", "oracle"]).mean(numeric_only=True).reset_index().to_excel(
+                w, index=False, sheet_name="aggregated"
+            )
+
+    plot_scalability_dj(df, str(scal_dir))
+
+    # ------------********------------ Reliability ======================
+    rel_path = rel_dir / "reliability_dj_hardware.xlsx"
+    rel_agg = (
+        df.groupby("n")
+          .agg(
+              success_rate=("correct", "mean"),
+              mean_queries=("queries_used", "mean"),
+              std_queries=("queries_used", "std"),
+          )
+          .reset_index()
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_path, engine="openpyxl") as w:
+            df[["n", "seed", "oracle", "prediction", "correct", "queries_used"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability_dj(df, str(rel_dir))
+
+    # ------------********------------ Carbon footprint ======================
+    excel_path = _resolve_carbon_path_notebook(excel_filename)
+    print(f"[carbon] Using CO2 file: {excel_path}")
+
+    carbon_df = pd.DataFrame()
+    summary_df = pd.DataFrame()
+
+    try:
+        intensity_df = load_carbon_table(excel_path, year_select=year_select)
+        carbon_df, summary_df = compute_carbon(
+            perf_df=df,
+            intensity_df=intensity_df,
+            device_power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_path = carb_dir / "carbon_dj_hardware.xlsx"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_path, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input_latest")
+
+        plot_carbon_dj(carbon_df, str(carb_dir))
+        print(f"[carbon] Results saved to {carb_path}")
+    except Exception as e:
+        print(f"[carbon] Failed to compute carbon footprint: {e}")
+
+    print("\n=== Deutsch–Jozsa hardware summary ===")
+    print(f"Performance Excel → {perf_path}")
+    print(f"Scalability Excel → {scal_path}")
+    print(f"Reliability Excel → {rel_path}")
+    print(f"Carbon folder     → {carb_dir}")
+
+    if not carbon_df.empty:
+        print("\n[carbon] Country-wise CO2 (latest year per country):")
+        display(carbon_df.head(10))
+
+    return {
+        "df": df,
+        "carbon_df": carbon_df,
+        "summary_df": summary_df,
+        "backend_name": backend_name,
+        "folders": {
+            "performance": perf_dir,
+            "scalability": scal_dir,
+            "reliability": rel_dir,
+            "carbon": carb_dir,
+        },
+    }
+# ------------********-------------------********----------------------********------------

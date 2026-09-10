@@ -1,0 +1,13 @@
+python quantum_hamiltonian_sim_noiseless.py ^
+  --sizes 2 4 ^
+  --steps 50 ^
+  --trials 10 ^
+  --time 1.0 ^
+  --trotter-steps 100 --order 2 ^
+  --J 1.0 --h 1.0 --periodic 0 ^
+  --acc-tol 0.90 --ref-mult 20 ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir carbon_by_country ^
+  --combine --workers 4

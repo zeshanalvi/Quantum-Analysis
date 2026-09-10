@@ -1,0 +1,968 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# quantum_trotterization_ibm_hardware_light_notebook.py
+# Quantum Trotterization (Heisenberg + Z field) — IBM Hardware (lightweight)
+
+#       * For each n_qubits, run ONE Trotter circuit on a real IBM backend
+#         (for the largest Trotter step m_max).
+#       * Measure hardware_runtime_sec, depth, etc.
+#       * Add hardware_runtime_sec to one row of perf_df for that (n, m_max).
+
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports
+
+import os
+import time
+import math
+import warnings
+import tracemalloc
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# ------------********------------
+# ------------********------------  Utility Functions
+# ------------********------------
+#These following utility functions handle filesystem setup, robust result export, and figure saving.
+#   Excel output is with a CSV fallback for error resilience.
+#       Directory creation and plotting helpers ensure clean output generation and resource cleanup.
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def write_excel(df_dict: Dict[str, pd.DataFrame], out_xlsx: str) -> None:
+    try:
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            for sheet, df in df_dict.items():
+                sheet_name = (sheet[:31] or "Sheet1")
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
+        print(f"[OK] Wrote Excel: {out_xlsx}")
+    except Exception as e:
+        print(f"[WARN] Could not write Excel ({e}). Falling back to CSVs.")
+        base = os.path.splitext(out_xlsx)[0]
+        for sheet, df in df_dict.items():
+            csv_path = f"{base}__{sheet}.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"[OK] Wrote CSV fallback: {csv_path}")
+
+    #Resolve a file path. If user_arg is given:
+    #  - If it's an existing path: return it.
+    #  - If it has no directory component, search Desktop for:
+    #           exact name, then add common extensions (.xlsx, .xls, .csv).
+    #If user_arg is None, try default_candidates on Desktop.
+
+def save_fig(fig: plt.Figure, path: str, dpi: int = 150) -> None:
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Saved plot: {path}")
+
+def resolve_desktop_file(user_arg: str | None,
+                         default_candidates: List[str]) -> str | None:
+    desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+    def exists(p): return os.path.isfile(p)
+
+    if user_arg:
+        base = user_arg.strip().strip('"').strip("'")
+        if exists(base):
+            return os.path.abspath(base)
+        candidate = os.path.join(desktop, base)
+        if exists(candidate):
+            return os.path.abspath(candidate)
+        exts = [".xlsx", ".xls", ".csv"]
+        if not os.path.splitext(base)[1]:
+            for ext in exts:
+                candidate = os.path.join(desktop, base + ext)
+                if exists(candidate):
+                    return os.path.abspath(candidate)
+        tail = os.path.split(base)[1].lower()
+        if os.path.isdir(desktop):
+            for fname in os.listdir(desktop):
+                if fname.lower() == tail or (not os.path.splitext(base)[1] and any(fname.lower() == tail + e for e in exts)):
+                    cand = os.path.join(desktop, fname)
+                    if exists(cand):
+                        return os.path.abspath(cand)
+        return None
+
+    for cand in default_candidates:
+        if exists(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+# ------------********------------
+# ------------********------------ Linear algebra helpers
+# ------------********------------
+
+#This function defines the four standard Pauli matrices used in quantum mechanics.
+#Each matrix is constructed explicitly as a 2×2 complex NumPy array.
+#The identity and X, Y, Z operators are returned together for convenient reuse.
+
+def paulis() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    I = np.array([[1, 0], [0, 1]], dtype=complex)
+    X = np.array([[0, 1], [1, 0]], dtype=complex)
+    Y = np.array([[0, -1j], [1j, 0]], dtype=complex)
+    Z = np.array([[1, 0], [0, -1]], dtype=complex)
+    return I, X, Y, Z
+
+#This following function computes the matrix exponential of a Hermitian operator using eigendecomposition.
+#Eigenvalues are exponentiated to form phase factors, ensuring numerical stability.
+#The result reconstructs the unitary evolution operator via the eigenbasis.
+
+def expm_hermitian(H: np.ndarray, dt: float) -> np.ndarray:
+    w, V = np.linalg.eigh(H)
+    phase = np.exp(-1j * dt * w)
+    return (V * phase) @ V.conj().T
+
+
+# ------------********------------
+# ------------********------------  Ideal gate construction & application
+# ------------********------------
+
+def two_qubit_heisenberg_gate(J: float, dt: float) -> np.ndarray:
+    _, X, Y, Z = paulis()
+    H_pair = J * (np.kron(X, X) + np.kron(Y, Y) + np.kron(Z, Z))
+    return expm_hermitian(H_pair, dt)
+
+def one_qubit_z_field_gate(h: float, dt: float) -> np.ndarray:
+    _, _, _, Z = paulis()
+    return expm_hermitian(h * Z, dt)
+
+
+# ------------********------------
+# ------------********------------ Statevector application
+# ------------********------------
+
+#This function applies a single-qubit unitary to a specified qubit of an n-qubit statevector.
+#It reshapes and reorders tensor axes to isolate the target qubit dimension.
+#The unitary is applied via matrix multiplication, then the state is restored to vector form.
+
+def apply_1q(U: np.ndarray, psi: np.ndarray, n: int, i: int) -> np.ndarray:
+    psi = psi.reshape([2] * n)
+    psi = np.moveaxis(psi, i, 0)
+    psi = (U @ psi.reshape(2, -1)).reshape([2] + [2] * (n - 1))
+    psi = np.moveaxis(psi, 0, i)
+    return psi.reshape(-1)
+
+#This function applies a two-qubit unitary to adjacent qubits within an n-qubit statevector.
+#It reshapes and permutes tensor axes to bring the target qubits together for matrix application.
+#After applying the unitary, the state is restored to its original vector layout.
+
+def apply_2q_nn(U: np.ndarray, psi: np.ndarray, n: int, i: int) -> np.ndarray:
+    psi = psi.reshape([2] * n)
+    psi = np.moveaxis(psi, (i, i + 1), (0, 1))
+    psi = (U @ psi.reshape(4, -1)).reshape([2, 2] + [2] * (n - 2))
+    psi = np.moveaxis(psi, (0, 1), (i, i + 1))
+    return psi.reshape(-1)
+
+
+#This function begins construction of the full many-body Hamiltonian for an n-qubit spin system.
+#       It retrieves the Pauli matrices and defines a helper to embed single-qubit operators into the full Hilbert space.
+
+def build_full_hamiltonian(n: int, J: float, h: float) -> np.ndarray:
+    I, X, Y, Z = paulis()
+
+    def single_qubit_op(i: int, op: np.ndarray) -> np.ndarray:
+        mats = [I] * n
+        mats[i] = op
+        out = mats[0]
+        for m in mats[1:]:
+            out = np.kron(out, m)
+        return out
+
+
+#This block completes construction of the full Heisenberg Hamiltonian.
+#   Nearest-neighbor XX, YY, and ZZ interaction terms are added across the chain.
+#       A local Z-field contribution is included for each qubit.
+#               The resulting dense Hamiltonian matrix is returned for exact simulation.
+
+    def two_qubit_op(i: int, j: int, op_i: np.ndarray, op_j: np.ndarray) -> np.ndarray:
+        mats = [I] * n
+        mats[i] = op_i
+        mats[j] = op_j
+        out = mats[0]
+        for m in mats[1:]:
+            out = np.kron(out, m)
+        return out
+
+    H = np.zeros((2**n, 2**n), dtype=complex)
+    for i in range(n - 1):
+        H += J * (two_qubit_op(i, i + 1, X, X) +
+                  two_qubit_op(i, i + 1, Y, Y) +
+                  two_qubit_op(i, i + 1, Z, Z))
+    for i in range(n):
+        H += h * single_qubit_op(i, Z)
+    return H
+
+# ------------********------------
+# ------------********------------ Simulation Ideal
+# ------------********------------
+
+#This function simulates time evolution using an ideal first-order Trotter decomposition.
+#   It applies shared two-qubit Heisenberg gates on even and odd nearest-neighbor bonds.
+#       Single-qubit Z-field rotations are applied to all qubits at each Trotter step.
+#           The statevector is updated iteratively to approximate continuous-time dynamics.
+
+def simulate_trotter_ideal(n: int, J: float, h: float, m_steps: int, T: float, psi0: np.ndarray) -> np.ndarray:
+    dt = T / m_steps
+    U2 = two_qubit_heisenberg_gate(J, dt)     # shared across all pairs
+    U1 = one_qubit_z_field_gate(h, dt)        # shared across all qubits
+
+    psi = psi0.copy()
+    for _ in range(m_steps):
+        # even bonds: (0,1), (2,3), ...
+        for i in range(0, n - 1, 2):
+            psi = apply_2q_nn(U2, psi, n, i)
+        # odd bonds: (1,2), (3,4), ...
+        for i in range(1, n - 1, 2):
+            psi = apply_2q_nn(U2, psi, n, i)
+        # on-site Z fields
+        for i in range(n):
+            psi = apply_1q(U1, psi, n, i)
+    return psi
+
+#These routines provide a ground-truth reference for Hamiltonian evolution using dense matrix exponentiation.
+#       The exact simulator is intended for accuracy evaluation rather than performance.
+#           An ℓ2 norm helper quantifies the deviation between approximate and exact statevectors.
+
+def simulate_exact_dense(n: int, J: float, h: float, T: float, psi0: np.ndarray) -> np.ndarray:
+    H = build_full_hamiltonian(n, J, h)
+    U = expm_hermitian(H, T)
+    return U @ psi0
+
+def l2_error(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
+
+
+# ------------********------------
+# ------------********------------  Plot helpers 
+# ------------********------------
+
+#These plotting functions visualize performance and accuracy of Trotterized simulations.
+#They generate log-scaled runtime, memory, and error trends across increasing Trotter steps and qubit counts.
+#A heatmap summarizes error behavior over the full parameter grid for quick comparison.
+#All figures are saved using a shared helper to ensure consistent layout and formatting.
+
+def plot_runtime_vs_steps(perf_df: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for n, sub in perf_df.groupby("n_qubits"):
+        sub = sub.sort_values("trotter_steps")
+        ax.plot(sub["trotter_steps"], sub["runtime_sec"], marker="o", label=f"n={n}")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Trotter steps (m)")
+    ax.set_ylabel("Runtime (s)")
+    ax.set_title("Runtime vs Trotter steps")
+    ax.legend()
+    save_fig(fig, out_path)
+
+def plot_memory_vs_steps(perf_df: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for n, sub in perf_df.groupby("n_qubits"):
+        sub = sub.sort_values("trotter_steps")
+        ax.plot(sub["trotter_steps"], sub["peak_mem_mb"], marker="s", label=f"n={n}")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Trotter steps (m)")
+    ax.set_ylabel("Peak allocated (MB, tracemalloc)")
+    ax.set_title("Memory vs Trotter steps")
+    ax.legend()
+    save_fig(fig, out_path)
+
+def plot_error_vs_steps(rel_df: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for n, sub in rel_df.groupby("n_qubits"):
+        sub = sub.sort_values("trotter_steps")
+        ax.plot(sub["trotter_steps"], sub["mean_error"], marker="o", label=f"n={n}")
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xlabel("Trotter steps (m)")
+    ax.set_ylabel("Mean L2 error (log scale)")
+    ax.set_title("Reliability: Error vs steps")
+    ax.legend()
+    save_fig(fig, out_path)
+
+def plot_error_heatmap(raw_err: pd.DataFrame, out_path: str) -> None:
+    piv = raw_err.pivot_table(index="n_qubits", columns="trotter_steps", values="error", aggfunc="mean")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.imshow(np.log10(piv.values + 1e-16), aspect="auto", origin="lower")
+    ax.set_xticks(range(len(piv.columns))); ax.set_xticklabels(piv.columns)
+    ax.set_yticks(range(len(piv.index)));   ax.set_yticklabels(piv.index)
+    ax.set_xlabel("Trotter steps (m)")
+    ax.set_ylabel("n_qubits")
+    ax.set_title("log10(Error): n vs m")
+    fig.colorbar(im, ax=ax, label="log10(L2 error)")
+    save_fig(fig, out_path)
+
+def plot_scaling_runtime_vs_dim(perf_df: pd.DataFrame, m_for_plot: int, out_path: str) -> None:
+    avail = sorted(perf_df["trotter_steps"].unique())
+    m = min(avail, key=lambda x: abs(x - m_for_plot))
+    sub = perf_df[perf_df["trotter_steps"] == m].copy()
+    sub["dimension"] = 2 ** sub["n_qubits"]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(sub["dimension"], sub["runtime_sec"], marker="o")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("Hilbert space dimension (2^n)")
+    ax.set_ylabel("Runtime (s)")
+    ax.set_title(f"Scalability: runtime vs dimension (m≈{m})")
+    save_fig(fig, out_path)
+
+def plot_scaling_runtime_vs_steps(perf_df: pd.DataFrame, n_for_plot: int, out_path: str) -> None:
+    sub = perf_df[perf_df["n_qubits"] == n_for_plot].copy().sort_values("trotter_steps")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(sub["trotter_steps"], sub["runtime_sec"], marker="o")
+    ax.set_xscale("log", base=2); ax.set_yscale("log")
+    ax.set_xlabel("Trotter steps (m)")
+    ax.set_ylabel("Runtime (s)")
+    ax.set_title(f"Scalability: runtime vs steps (n={n_for_plot})")
+    save_fig(fig, out_path)
+
+def plot_carbon_distribution(worst_table: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7.5, 6))
+    ax.hist(worst_table["kgCO2e"].values, bins=30)
+    ax.set_xlabel("kg CO2e")
+    ax.set_title("Carbon: Emission distribution")
+    save_fig(fig, out_path)
+
+def plot_carbon_topN(worst_table: pd.DataFrame, N: int, out_path: str) -> None:
+    s = worst_table.sort_values("kgCO2e", ascending=False).head(N)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.barh(s["Country"], s["kgCO2e"])
+    ax.invert_yaxis()
+    ax.set_xlabel("kg CO2e")
+    ax.set_title(f"Carbon: Top {N} countries")
+    save_fig(fig, out_path)
+
+def plot_carbon_median_vs_steps(country_emissions: pd.DataFrame, n_for_plot: int, out_path: str) -> None:
+    sub = country_emissions[country_emissions["n_qubits"] == n_for_plot]
+    med = sub.groupby("trotter_steps")["emissions_kgCO2"].median().reset_index()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(med["trotter_steps"], med["emissions_kgCO2"], marker="o")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Trotter steps (m)")
+    ax.set_ylabel("Median emissions across countries (kg CO2e)")
+    ax.set_title(f"Median emissions vs steps (n={n_for_plot})")
+    save_fig(fig, out_path)
+
+
+# ------------********------------
+# ------------********------------ Carbon logic
+# ------------********------------
+
+def load_country_co2(path: str, year_select: str = "latest") -> pd.DataFrame:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"CO2 file not found: {path}")
+    df = pd.read_csv(path) if path.lower().endswith(".csv") else pd.read_excel(path)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    cname = next((c for c in df.columns if "country" in c or c in ("name", "nation")), None)
+    if cname is None:
+        raise ValueError("Could not find a 'country' column.")
+    yname = next((c for c in df.columns if "year" in c), None)
+
+    cand = [c for c in df.columns if "intensity" in c]
+    if not cand: cand = [c for c in df.columns if ("co2" in c and "kwh" in c)]
+    if not cand: cand = [c for c in df.columns if (("kg" in c or "g" in c) and "kwh" in c)]
+    if not cand:
+        raise ValueError("No intensity column found.")
+    icol = cand[0]
+
+    use_cols = [cname, icol] + ([yname] if yname else [])
+    out = df[use_cols].dropna().copy()
+    out.columns = ["country", "intensity_raw"] + (["year"] if yname else [])
+    out["intensity_raw"] = pd.to_numeric(out["intensity_raw"], errors="coerce")
+    out = out.dropna(subset=["intensity_raw"])
+
+    if np.nanmedian(out["intensity_raw"].values) > 10.0:
+        out["kg_per_kwh"] = out["intensity_raw"] / 1000.0
+    else:
+        out["kg_per_kwh"] = out["intensity_raw"]
+
+    out["country"] = out["country"].astype(str).str.strip().str.title()
+    if yname and year_select == "latest":
+        out = out.sort_values(["country", "year"]).groupby("country", as_index=False).tail(1)
+
+    cols = ["country", "kg_per_kwh"] + (["year"] if yname else [])
+    return out[cols].drop_duplicates()
+
+def compute_emissions(perf_df: pd.DataFrame,
+                      co2_df: pd.DataFrame,
+                      power_watts: float,
+                      pue: float) -> pd.DataFrame:
+    perf = perf_df.copy()
+    perf["energy_kwh"] = (perf["runtime_sec"] * power_watts) / 3.6e6
+    perf["energy_kwh"] *= pue
+    co2 = co2_df.rename(columns={"kg_per_kwh": "kgco2_per_kwh"}).copy()
+    perf["_key"] = 1; co2["_key"] = 1
+    joined = perf.merge(co2, on="_key").drop(columns="_key")
+    joined["emissions_kgCO2"] = joined["energy_kwh"] * joined["kgco2_per_kwh"]
+    return joined
+
+def build_worstcase_country_table(perf_df: pd.DataFrame,
+                                  co2_df: pd.DataFrame,
+                                  power_watts: float,
+                                  pue: float) -> Tuple[pd.DataFrame, dict]:
+    n_heavy = int(perf_df["n_qubits"].max())
+    m_heavy = int(perf_df["trotter_steps"].max())
+    mean_runtime_s = float(perf_df[(perf_df["n_qubits"] == n_heavy) &
+                                   (perf_df["trotter_steps"] == m_heavy)]["runtime_sec"].mean())
+    energy_kwh = mean_runtime_s * power_watts / 3.6e6 * pue
+
+    tbl = co2_df.copy()
+    if "year" not in tbl.columns:
+        tbl["year"] = pd.NA
+    tbl_out = pd.DataFrame({
+        "Country": tbl["country"].astype(str),
+        "Year": tbl["year"],
+        "Intensity": tbl["kg_per_kwh"],   # kg CO2e / kWh
+        "kWh": energy_kwh,                # constant across countries here
+    })
+    tbl_out["kgCO2e"] = tbl_out["Intensity"] * tbl_out["kWh"]
+    tbl_out = tbl_out.sort_values("kgCO2e", ascending=False).reset_index(drop=True)
+
+    meta = {"n_heavy": n_heavy, "m_heavy": m_heavy,
+            "mean_runtime_s": mean_runtime_s, "power_watts": power_watts,
+            "pue": pue, "kWh_used": energy_kwh}
+    return tbl_out, meta
+
+
+# ------------********------------
+# ------------********------------ Benchmark driver 
+# ------------********------------
+
+#This worker function executes a single Trotter simulation task for a given parameter set.
+#   It builds the Heisenberg Hamiltonian, prepares a random initial quantum state, and runs both exact and approximate evolution.
+#           Runtime and peak memory usage are measured using high-resolution timers and tracemalloc.
+#                   The function returns separate dictionaries for performance metrics and numerical error analysis.
+
+def _one_task(args):
+    n, m, r, seed_base, J, h, T = args
+    rng = np.random.default_rng(seed_base + (n * 1009) + (m * 9176) + r)
+    dim = 2 ** n
+    psi0 = rng.standard_normal(dim) + 1j * rng.standard_normal(dim)
+    psi0 = psi0 / np.linalg.norm(psi0)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    psi_t = simulate_trotter_ideal(n, J, h, m_steps=m, T=T, psi0=psi0)   # ideal trotter
+    psi_e = simulate_exact_dense(n, J, h, T, psi0)                       # exact dense
+
+    runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    err = l2_error(psi_t, psi_e)
+    return {
+        "n_qubits": n, "dimension": dim, "trotter_steps": m, "repeat": r,
+        "runtime_sec": runtime, "peak_mem_mb": peak / (1024 ** 2),
+    }, {
+        "n_qubits": n, "dimension": dim, "trotter_steps": m, "repeat": r,
+        "error": err,
+    }
+
+#This function orchestrates the full benchmark sweep across qubit counts, Trotter steps, and repetitions.
+#It assembles all experiment tasks and supports parallel execution using multiple worker processes.
+#Performance and error metrics from each task are collected into separate result tables.
+#The aggregated results are returned as pandas DataFrames for downstream analysis and plotting.
+
+def run_benchmarks(n_list: List[int],
+                   m_list: List[int],
+                   repeats: int,
+                   J: float,
+                   h: float,
+                   T: float,
+                   rng_seed: int,
+                   workers: int = 1) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    from multiprocessing import Pool, cpu_count
+    tasks = [(n, m, r, rng_seed, J, h, T)
+             for n in n_list for m in m_list for r in range(repeats)]
+    perf_rows, err_rows = [], []
+    if workers and workers > 1:
+        workers = min(workers, cpu_count())
+        with Pool(processes=workers) as pool:
+            for perf_row, err_row in pool.imap_unordered(_one_task, tasks):
+                perf_rows.append(perf_row); err_rows.append(err_row)
+    else:
+        for t in tasks:
+            perf_row, err_row = _one_task(t)
+            perf_rows.append(perf_row); err_rows.append(err_row)
+    return pd.DataFrame(perf_rows), pd.DataFrame(err_rows)
+
+
+#This function aggregates raw error measurements to assess simulation reliability.
+#Errors are grouped by system size and Trotter step count.
+#Summary statistics such as mean, variance, extrema, and sample count are computed for analysis.
+
+def summarize_reliability(err_raw: pd.DataFrame) -> pd.DataFrame:
+    g = err_raw.groupby(["n_qubits", "trotter_steps"], as_index=False)
+    return g.agg(mean_error=("error", "mean"),
+                 std_error=("error", "std"),
+                 max_error=("error", "max"),
+                 min_error=("error", "min"),
+                 num_runs=("error", "count"))
+
+def summarize_scalability(perf_df: pd.DataFrame) -> pd.DataFrame:
+    m_target = perf_df["trotter_steps"].max()
+    sub_dim = perf_df.loc[perf_df["trotter_steps"] == m_target].copy()
+    sub_dim["dimension"] = 2 ** sub_dim["n_qubits"]
+    sub_dim = sub_dim.groupby(["n_qubits", "dimension"], as_index=False)["runtime_sec"].mean()
+    x = np.log(sub_dim["dimension"].values + 1e-16)
+    y = np.log(sub_dim["runtime_sec"].values + 1e-16)
+    alpha, _ = np.polyfit(x, y, 1)
+
+    n_target = perf_df["n_qubits"].max()
+    sub_steps = perf_df.loc[perf_df["n_qubits"] == n_target].copy()
+    sub_steps = sub_steps.groupby(["trotter_steps"], as_index=False)["runtime_sec"].mean()
+    xb = np.log(sub_steps["trotter_steps"].values + 1e-16)
+    yb = np.log(sub_steps["runtime_sec"].values + 1e-16)
+    beta, _ = np.polyfit(xb, yb, 1)
+
+    return pd.DataFrame({
+        "fit_parameter": ["alpha_dim_scaling", "beta_step_scaling"],
+        "estimate": [alpha, beta],
+        "note": [f"Fixed m≈{m_target}", f"Fixed n={n_target}"]
+    })
+
+
+# ------------********------------
+# ------------********------------ IBM hardware Trotter circuit (lightweight)
+# ------------********------------
+
+def build_trotter_circuit_ibm(
+    n_qubits: int,
+    J: float,
+    h: float,
+    m_steps_hw: int,
+    T: float,
+) -> QuantumCircuit:
+
+# ------------********------------
+    """
+    Build a gate-based first-order Trotter circuit for:
+        H = J * sum (XX+YY+ZZ) + h * sum Z
+    on a line of n_qubits, using native RXX/RYy/RZZ + RZ rotations.
+
+    - Initial state: |0...0>
+    - For each Trotter step:
+        * even bonds: RXX, RYY, RZZ
+        * odd bonds:  RXX, RYY, RZZ
+        * local fields: RZ
+    """
+# ------------********------------
+
+    qc = QuantumCircuit(n_qubits, n_qubits)
+    qubits = list(range(n_qubits))
+
+    m_steps_hw = max(1, int(m_steps_hw))
+    dt = float(T) / float(m_steps_hw)
+
+    theta_pair = 2.0 * J * dt   # for RXX/RYy/RZZ
+    theta_z = 2.0 * h * dt      # for RZ
+
+    def layer_2q_pairs(start):
+        for i in range(start, n_qubits - 1, 2):
+            qc.rxx(theta_pair, i, i+1)
+            qc.ryy(theta_pair, i, i+1)
+            qc.rzz(theta_pair, i, i+1)
+
+    def layer_z_fields():
+        for i in qubits:
+            qc.rz(theta_z, i)
+
+    for _ in range(m_steps_hw):
+        layer_2q_pairs(0)   # even bonds
+        layer_2q_pairs(1)   # odd bonds
+        layer_z_fields()
+
+    qc.measure(qubits, qubits)
+    return qc
+
+def get_ibm_sampler(backend_name: str, shots: int):
+    """
+    Initialize QiskitRuntimeService and SamplerV2 for the given backend.
+    Assumes IBM account is already saved.
+    """
+    print("[ibm] Initializing QiskitRuntimeService...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = SamplerV2(mode=backend)
+    return backend, sampler, pm
+
+def hardware_trotterization_single(
+    n_qubits: int,
+    J: float,
+    h: float,
+    m_steps: int,
+    T: float,
+    backend,
+    sampler: SamplerV2,
+    pass_manager,
+    shots: int,
+    hardware_trotter_steps: int,
+) -> dict:
+
+    """
+    Run ONE Trotterized circuit on IBM hardware:
+      - Uses n_qubits qubits (must be ≤ backend.num_qubits).
+      - Uses r_hw = min(m_steps, hardware_trotter_steps) Trotter steps.
+      - Initial state |0...0>, measure all qubits.
+      - Returns hardware_runtime_s and basic circuit metrics.
+    """
+
+    if backend.num_qubits < n_qubits:
+        print(f"[trotter-ibm-light] WARNING: backend {backend.name} has only "
+              f"{backend.num_qubits} qubits, but n_qubits={n_qubits} requested. "
+              f"Skipping hardware run for this n.")
+        return {
+            "hardware_runtime_sec": 0.0,
+            "hardware_circuit_depth": 0,
+            "hardware_qubits": n_qubits,
+            "hardware_m_hw": 0,
+            "hardware_shots": int(shots),
+            "hardware_counts_total": 0,
+        }
+
+    m_hw = max(1, min(int(m_steps), int(hardware_trotter_steps)))
+    qc = build_trotter_circuit_ibm(
+        n_qubits=n_qubits,
+        J=J,
+        h=h,
+        m_steps_hw=m_hw,
+        T=T,
+    )
+
+    isa_circs = pass_manager.run([qc])
+    depth = isa_circs[0].depth()
+
+    print(f"[trotter-ibm-light] Submitting 1 Trotter circuit (n={n_qubits}, m_hw={m_hw}) to backend {backend.name}...")
+    t0_hw = time.perf_counter()
+    job = sampler.run(isa_circs, shots=int(shots))
+    primitive_result = job.result()
+    hw_runtime = time.perf_counter() - t0_hw
+    print(f"[trotter-ibm-light] Hardware job finished in {hw_runtime:.3f} s.")
+
+    pub_res = primitive_result[0]
+    joined = pub_res.join_data()
+    counts = joined.get_counts()
+    total_counts = sum(counts.values())
+
+    return {
+        "hardware_runtime_sec": float(hw_runtime),
+        "hardware_circuit_depth": int(depth),
+        "hardware_qubits": int(n_qubits),
+        "hardware_m_hw": int(m_hw),
+        "hardware_shots": int(shots),
+        "hardware_counts_total": int(total_counts),
+    }
+
+
+# ------------********------------
+# ------------********------------ Notebook entry point
+# ------------********------------
+
+def run_trotterization_ibm_hardware_notebook(
+    n_min: int = 2,
+    n_max: int = 6,
+    steps: Tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+    repeats: int = 2,
+    J: float = 1.0,
+    h: float = 0.5,
+    T: float = 1.0,
+    seed: int = 7,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str | None = None,
+    backend_name: str = "ibm_torino",
+    shots: int = 256,
+    workers: int = 1,
+    hardware_trotter_steps: int = 8,   # keep hardware circuits shallow
+):
+
+# ------------********-----------------------********----------------------********------------
+    """
+    Quantum Trotterization benchmark with IBM hardware in the loop (lightweight).
+
+    Parameters mirror my CLI, plus backend/shots/hardware_trotter_steps:
+
+      n_min, n_max         : min/max number of qubits
+      steps                : tuple/list of Trotter step counts m (e.g., (1,2,4,8,16,32))
+      repeats              : repeats per (n,m)
+      J, h, T              : Heisenberg coupling, field strength, total time
+      seed                 : random seed for ideal simulation
+      excel_filename       : CO2 file name (looked up on Desktop or via full path)
+      device_power_watts   : average device power (W) for carbon (keep 65.0)
+      pue                  : power usage effectiveness (keep 1.2)
+      year_select          : "latest" for most recent year per country
+      outdir               : root output directory; inside it we create:
+                                Performance/, Scalability/, Reliability/, Carbon/
+      backend_name         : IBM backend name (e.g., "ibm_torino")
+      shots                : shots per Trotter circuit on hardware
+      workers              : #workers for ideal simulation (multiprocessing)
+      hardware_trotter_steps : max Trotter steps used on hardware (≤ m)
+    """
+# ------------********-----------------------********----------------------********------------
+
+# ------------********------------ parameter setup ---
+    if n_max < n_min or n_min < 1:
+        raise ValueError("Invalid n range.")
+    n_list = list(range(int(n_min), int(n_max) + 1))
+    m_list = sorted({int(m) for m in steps if int(m) > 0})
+    if not m_list:
+        raise ValueError("steps must contain at least one positive integer.")
+
+    print("[trotter-ibm-light] Quantum Trotterization IBM hardware benchmark (lightweight)")
+    print("  n_list:", n_list)
+    print("  m_list (Trotter steps):", m_list)
+    print(f"  repeats={repeats}, J={J}, h={h}, T={T}, seed={seed}")
+    print(f"  backend={backend_name}, shots={shots}, hardware_trotter_steps={hardware_trotter_steps}")
+    print(f"  excel_filename={excel_filename}")
+    print(f"  power={device_power_watts} W, PUE={pue}, year_select={year_select}")
+
+ # ------------********------------- CO2 path resolution (Desktop by default) ---
+    desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+    defaults = [
+        os.path.join(desktop, "Filtered CO2 intensity 236 Countries.xlsx"),
+        os.path.join(desktop, "Filtered CO2 intensity 236 Countries.csv"),
+        os.path.join(desktop, "countries_co2.xlsx"),
+        os.path.join(desktop, "countries_co2.csv"),
+    ]
+    co2_path = resolve_desktop_file(excel_filename, defaults)
+    if co2_path is None:
+        print("[WARN] CO2 file not found on Desktop. "
+              "Run again with a correct excel_filename or full path.")
+    else:
+        print(f"[INFO] Using CO2 file: {co2_path}")
+
+# ------------********------------ Output directories (same structure as noiseless script) ---
+    if outdir is None:
+        root = os.getcwd()
+    else:
+        root = os.path.abspath(outdir)
+
+    perf_dir = os.path.join(root, "Performance")
+    scal_dir = os.path.join(root, "Scalability")
+    reli_dir = os.path.join(root, "Reliability")
+    carb_dir = os.path.join(root, "Carbon")
+    for d in (perf_dir, scal_dir, reli_dir, carb_dir):
+        ensure_dir(d)
+
+    print("[INFO] Output root:", root)
+    print("       - Performance ->", perf_dir)
+    print("       - Scalability ->", scal_dir)
+    print("       - Reliability ->", reli_dir)
+    print("       - Carbon      ->", carb_dir)
+
+# ------------********------------- Ideal benchmarks (same as noiseless) ---
+    print("[INFO] Running ideal Trotter benchmarks (noiseless) ...")
+    t_all0 = time.perf_counter()
+    perf_df, err_raw = run_benchmarks(
+        n_list=n_list,
+        m_list=m_list,
+        repeats=int(repeats),
+        J=J,
+        h=h,
+        T=T,
+        rng_seed=int(seed),
+        workers=max(1, int(workers)),
+    )
+    print(f"[INFO] Ideal benchmarks finished in {time.perf_counter() - t_all0:.2f}s")
+
+ # ------------********------------ IBM hardware primitives (used once per n at largest m) ---
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+
+    m_heavy = max(m_list)
+    hw_metrics_by_n = {}
+
+    for n in n_list:
+        print(f"\n[trotter-ibm-light] Running hardware Trotter for n={n}, m_heavy={m_heavy}")
+        hw_metrics = hardware_trotterization_single(
+            n_qubits=n,
+            J=J,
+            h=h,
+            m_steps=m_heavy,
+            T=T,
+            backend=backend,
+            sampler=sampler,
+            pass_manager=pm,
+            shots=shots,
+            hardware_trotter_steps=hardware_trotter_steps,
+        )
+        hw_metrics_by_n[n] = hw_metrics
+
+ # ------------********------------ Merge hardware runtime into perf_df ---
+    perf_df_ibm = perf_df.copy()
+    perf_df_ibm["hardware_runtime_sec"] = 0.0
+    perf_df_ibm["hardware_circuit_depth"] = 0
+    perf_df_ibm["hardware_qubits"] = perf_df_ibm["n_qubits"]
+    perf_df_ibm["hardware_m_hw"] = 0
+    perf_df_ibm["hardware_shots"] = int(shots)
+    perf_df_ibm["hardware_counts_total"] = 0
+
+    for n in n_list:
+        hw = hw_metrics_by_n.get(n, None)
+        if hw is None:
+            continue
+        mask_nm = (perf_df_ibm["n_qubits"] == n) & (perf_df_ibm["trotter_steps"] == m_heavy)
+        idx_nm = perf_df_ibm[mask_nm].sort_values("repeat").index.tolist()
+        if not idx_nm:
+            continue
+        first_idx = idx_nm[0]
+
+        perf_df_ibm.loc[first_idx, "hardware_runtime_sec"] = hw["hardware_runtime_sec"]
+        perf_df_ibm.loc[first_idx, "hardware_circuit_depth"] = hw["hardware_circuit_depth"]
+        perf_df_ibm.loc[first_idx, "hardware_qubits"] = hw["hardware_qubits"]
+        perf_df_ibm.loc[first_idx, "hardware_m_hw"] = hw["hardware_m_hw"]
+        perf_df_ibm.loc[first_idx, "hardware_shots"] = hw["hardware_shots"]
+        perf_df_ibm.loc[first_idx, "hardware_counts_total"] = hw["hardware_counts_total"]
+
+        # Add hardware runtime into total runtime_sec for that run
+        perf_df_ibm.loc[first_idx, "runtime_sec"] = (
+            perf_df_ibm.loc[first_idx, "runtime_sec"] + hw["hardware_runtime_sec"]
+        )
+
+# ------------********------------ PERFORMANCE
+
+#This following block summarizes performance metrics across qubit counts and Trotter step sizes.
+#   Mean and variability of runtime and memory usage are computed for each configuration.
+#       Both raw data and aggregated summaries are exported to an Excel report.
+#       Runtime and memory scaling plots are generated to visualize performance trends.
+
+    perf_summary = perf_df_ibm.groupby(["n_qubits", "trotter_steps"], as_index=False).agg(
+        mean_runtime_sec=("runtime_sec", "mean"),
+        std_runtime_sec=("runtime_sec", "std"),
+        mean_hw_runtime_sec=("hardware_runtime_sec", "mean"),
+        mean_peak_mem_mb=("peak_mem_mb", "mean"),
+        std_peak_mem_mb=("peak_mem_mb", "std"),
+    )
+
+    perf_xlsx = os.path.join(perf_dir, "performance_ibm_hardware.xlsx")
+    write_excel(
+        {"raw": perf_df_ibm.sort_values(["n_qubits", "trotter_steps", "repeat"]),
+         "summary": perf_summary.sort_values(["n_qubits", "trotter_steps"])},
+        perf_xlsx,
+    )
+
+    plot_runtime_vs_steps(perf_df_ibm, os.path.join(perf_dir, "runtime_vs_steps_ibm_hardware.png"))
+    plot_memory_vs_steps(perf_df_ibm, os.path.join(perf_dir, "memory_vs_steps_ibm_hardware.png"))
+
+ # ------------********------------ RELIABILITY (same as ideal, errors from exact vs trotter) ---
+
+    rel_summary = summarize_reliability(err_raw)
+    rel_xlsx = os.path.join(reli_dir, "reliability_ibm_hardware.xlsx")
+    write_excel(
+        {"errors_raw": err_raw.sort_values(["n_qubits", "trotter_steps", "repeat"]),
+         "errors_summary": rel_summary.sort_values(["n_qubits", "trotter_steps"])},
+        rel_xlsx,
+    )
+    plot_error_vs_steps(rel_summary, os.path.join(reli_dir, "error_vs_steps_ibm_hardware.png"))
+    plot_error_heatmap(err_raw, os.path.join(reli_dir, "error_heatmap_ibm_hardware.png"))
+
+# ------------********------------ SCALABILITY (use updated perf_df_ibm) ---
+
+    scaling_fit = summarize_scalability(perf_df_ibm)
+    scal_xlsx = os.path.join(scal_dir, "scalability_ibm_hardware.xlsx")
+    write_excel(
+        {"perf_raw": perf_df_ibm.sort_values(["n_qubits", "trotter_steps", "repeat"]),
+         "scaling_fit": scaling_fit},
+        scal_xlsx,
+    )
+    plot_scaling_runtime_vs_dim(perf_df_ibm, m_for_plot=m_heavy,
+                                out_path=os.path.join(scal_dir, "runtime_vs_dimension_loglog_ibm_hardware.png"))
+    plot_scaling_runtime_vs_steps(perf_df_ibm, n_for_plot=max(n_list),
+                                  out_path=os.path.join(scal_dir, "runtime_vs_steps_at_largest_n_ibm_hardware.png"))
+
+# ------------********------------ CARBON (Performance-only, with hardware time included) ---
+
+    carbon_df = None
+    summary_df = None
+    if co2_path and os.path.isfile(co2_path):
+        co2_df = load_country_co2(co2_path, year_select=year_select)
+        carbon_df = compute_emissions(perf_df_ibm, co2_df,
+                                      power_watts=device_power_watts, pue=pue)
+        worst_table, meta = build_worstcase_country_table(perf_df_ibm, co2_df,
+                                                          power_watts=device_power_watts, pue=pue)
+
+        carb_xlsx = os.path.join(carb_dir, "carbon_footprint_ibm_hardware.xlsx")
+        write_excel(
+            {
+                "co2_by_country": (co2_df.rename(columns={"kg_per_kwh": "kgco2_per_kwh"})
+                                   if "kg_per_kwh" in co2_df.columns else co2_df),
+                "emissions_all": carbon_df.sort_values(["n_qubits", "trotter_steps", "country"]),
+                "worst_case_table": worst_table,
+                "worst_case_metadata": pd.DataFrame([meta]),
+            },
+            carb_xlsx,
+        )
+        plot_carbon_distribution(worst_table, os.path.join(carb_dir, "carbon_distribution_ibm_hardware.png"))
+        plot_carbon_topN(worst_table, 15, os.path.join(carb_dir, "carbon_top15_ibm_hardware.png"))
+        plot_carbon_median_vs_steps(carbon_df, n_for_plot=meta["n_heavy"],
+                                    out_path=os.path.join(carb_dir, "median_emissions_vs_steps_ibm_hardware.png"))
+        summary_df = pd.DataFrame([meta])
+    else:
+        placeholder = pd.DataFrame({
+            "note": ["CO2 file not provided. Carbon workbook/plots were skipped."],
+            "hint": ["Run again with a valid excel_filename or full path."]
+        })
+        carb_xlsx = os.path.join(carb_dir, "carbon_placeholder_ibm_hardware.xlsx")
+        write_excel({"info": placeholder}, carb_xlsx)
+
+    print("\n[DONE] IBM hardware Trotterization benchmark complete.")
+    print(f"Performance Excel:  {perf_xlsx}")
+    print(f"Scalability Excel:  {scal_xlsx}")
+    print(f"Reliability Excel:  {rel_xlsx}")
+    print(f"Carbon Excel:       {os.path.join(carb_dir, 'carbon_footprint_ibm_hardware.xlsx')}")
+    print("Folders created under:", root)
+    print("  - Performance")
+    print("  - Scalability")
+    print("  - Reliability")
+    print("  - Carbon")
+
+    return {
+        "perf_df": perf_df_ibm,
+        "err_raw": err_raw,
+        "perf_dir": perf_dir,
+        "scal_dir": scal_dir,
+        "rel_dir": reli_dir,
+        "carb_dir": carb_dir,
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }

@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+
+
+# ----------------------------------------------------------------------------------------------------------------
+
+# qaoa_benchmark_ibm 
+# (hardware, ibm_torino 133 Qubits)
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+# ------------********------------ Imports
+import os, time, math, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from datetime import datetime
+from qiskit import QuantumCircuit
+from qiskit.transpiler import generate_preset_pass_manager
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
+
+# ------------********------------ CONFIG 
+
+#This configuration block defines global constants for QAOA benchmarking, including problem type, 
+#shot count, timestamps, and carbon-related assumptions.
+#It sets up output directories for performance, scalability, reliability, and carbon-footprint results, creating them if needed.
+#It also constructs standardized file paths for the Excel outputs that each benchmark module will generate.
+
+
+PROBLEM = "maxcut"        
+SHOTS = 2048
+TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Carbon assumptions (same defaults you asked for)
+ASSUMED_DEVICE_POWER_W = 65.0
+PUE_FACTOR = 1.2
+GRID_INTENSITY_KG_PER_KWH = 0.45
+
+# Output folders / files
+OUT_PERF_DIR = "Performance"
+OUT_SCAL_DIR = "Scalability"
+OUT_RELI_DIR = "Reliability"
+OUT_CARB_DIR = os.path.join("CarbonFootprints", TS)
+for d in (OUT_PERF_DIR, OUT_SCAL_DIR, OUT_RELI_DIR, OUT_CARB_DIR):
+    os.makedirs(d, exist_ok=True)
+
+PERF_XLS = os.path.join(OUT_PERF_DIR, "performance.xlsx")
+SCAL_XLS = os.path.join(OUT_SCAL_DIR, "scalability.xlsx")
+RELI_XLS = os.path.join(OUT_RELI_DIR, "reliability.xlsx")
+CARB_XLS = os.path.join(OUT_CARB_DIR, "carbon_footprints.xlsx")
+
+# ------------********------------ Backend Selection
+
+#This block initializes the quantum backend, creating a Qiskit Runtime service and selecting a hardware device if one is not already defined.
+#It sets up a Sampler bound to that backend and prepares preset pass managers for fast or optimized transpilation.
+#The helper function wraps these pass managers, enabling easy transpilation of circuits to the backend’s native instruction set.
+
+
+try:
+    backend
+except NameError:
+    service = QiskitRuntimeService()                     #
+    backend = service.backend("ibm_torino")
+print(f"Using backend: {backend.name} | qubits={backend.num_qubits} | queue={backend.status().pending_jobs}")
+
+sampler = Sampler(mode=backend)
+
+# Helper: transpile to the backend ISA (prevents IBMInputValueError)
+pm_fast = generate_preset_pass_manager(optimization_level=1, backend=backend)
+pm_opt  = generate_preset_pass_manager(optimization_level=2, backend=backend)
+def transpile_hw(qc, fast=False):
+    return (pm_fast if fast else pm_opt).run(qc)
+
+
+# ------------********------------ Helpers Functions
+
+#This function generates a random symmetric weighted graph by sampling an edge mask with probability *p* and assigning random weights.
+#It keeps only the upper-triangular part, mirrors it to form an undirected adjacency matrix, and ensures no self-loops are included.
+#The resulting matrix provides a simple weighted Max-Cut instance for benchmarking or circuit construction.
+
+def random_weighted_graph(n, p=0.5, seed=0):
+    rng = np.random.default_rng(seed)
+    mask = rng.random((n, n)) < p
+    weights = rng.integers(1, 10, size=(n, n))
+    W = np.triu(mask * weights, 1)
+    W += W.T
+    return W
+
+def maxcut_obj(x, W):
+    # x in {0,1}^n; objective = sum_{(i,j) in E} w_ij * [x_i != x_j]
+    # implement via Ising trick for speed:
+    s = 1 - 2 * x  # {+1,-1}
+    return 0.25 * (np.sum(W) - np.sum(W * np.outer(s, s)))
+
+
+#This function visualizes a Max-Cut assignment, using NetworkX when available to construct 
+#a spring-layout graph with colored partitions and dashed cut edges.
+#If NetworkX is missing, it falls back to a manual circular layout, drawing nodes, weighted edges, 
+#and marking cut edges with dashed red lines.
+#In both modes, it saves the generated plot to the specified output path for inspection or reporting.
+
+def plot_maxcut_graph(W, x, out_path, title=""):
+    try:
+        import networkx as nx
+        import matplotlib.pyplot as plt
+        G = nx.Graph()
+        n = W.shape[0]
+        for i in range(n):
+            G.add_node(i, part=int(x[i]))
+        for i in range(n):
+            for j in range(i + 1, n):
+                if W[i, j] > 0:
+                    G.add_edge(i, j, weight=int(W[i, j]), cut=(x[i] != x[j]))
+        pos = nx.spring_layout(G, seed=42)
+        colors = ["tab:blue" if G.nodes[i]["part"] == 0 else "tab:orange" for i in G.nodes()]
+        cut_edges = [(u, v) for u, v, d in G.edges(data=True) if d["cut"]]
+        nx.draw(G, pos, node_color=colors, with_labels=True, edge_color="gray")
+        nx.draw_networkx_edges(G, pos, edgelist=cut_edges, style="dashed", edge_color="red")
+        plt.title(title); plt.axis("off"); plt.tight_layout()
+        plt.savefig(out_path, dpi=300); plt.close()
+    except ModuleNotFoundError:
+        # Fallback without networkx: circular layout + dashed cut edges
+        import math
+        import matplotlib.pyplot as plt
+        n = W.shape[0]
+        theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        pos = {i: (math.cos(t), math.sin(t)) for i, t in enumerate(theta)}
+        colors = ["tab:blue" if int(x[i]) == 0 else "tab:orange" for i in range(n)]
+
+        plt.figure(figsize=(4, 4))
+        # draw edges (dashed = cut)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if W[i, j] > 0:
+                    xs = [pos[i][0], pos[j][0]]
+                    ys = [pos[i][1], pos[j][1]]
+                    cut = (x[i] != x[j])
+                    plt.plot(xs, ys,
+                             linestyle="dashed" if cut else "solid",
+                             color="red" if cut else "gray",
+                             linewidth=1)
+        # draw nodes + labels
+        for i in range(n):
+            plt.scatter(pos[i][0], pos[i][1], s=200, c=colors[i], edgecolors="black", zorder=3)
+            plt.text(pos[i][0], pos[i][1], str(i), ha="center", va="center", fontsize=9, zorder=4)
+        plt.title(title); plt.axis("off"); plt.tight_layout()
+        plt.savefig(out_path, dpi=300); plt.close()
+
+#This function builds a minimal QAOA-style quantum circuit by applying Hadamard gates to create a uniform superposition.
+#It then applies weighted ZZ-phase rotations for every non-zero edge in the graph, 
+# using a fixed γ parameter for simplicity.
+#Finally, it inserts a barrier, measures all qubits, and returns the completed circuit.
+
+def build_simple_qaoa_like_circuit(W):
+    """Lightweight QAOA-style layer: H on all qubits, ZZ phase on each weighted edge, then measure."""
+    n = W.shape[0]
+    qc = QuantumCircuit(n)
+    qc.h(range(n))
+    gamma = 0.8  # fixed parameter to keep parity with my simulator defaults
+    for i in range(n):
+        for j in range(i+1, n):
+            if W[i, j] != 0:
+                qc.rzz(gamma * float(W[i, j]), i, j)
+    qc.barrier()
+    qc.measure_all()
+    return qc
+
+# ------------********------------ Performance Metrics
+
+#This block runs small Max-Cut QAOA-style circuits on real quantum hardware, 
+#collecting runtime, job IDs, and objective values for each instance.
+#For every generated graph, it transpiles the circuit to the backend ISA, 
+#executes it with a fixed shot count, extracts the best bitstring, and evaluates its Max-Cut value.
+#It logs results to Excel, saves visualizations of each instance, 
+#and produces a runtime bar plot for quick performance comparison.
+
+print("[Performance] Running on hardware…")
+perf_records = []
+perf_n = 6                    # small n to keep queue/runtime reasonable on real hardware
+instances = 3
+
+for inst in range(instances):
+    W = random_weighted_graph(perf_n, 0.5, seed=42+inst)
+    qc = build_simple_qaoa_like_circuit(W)
+    tqc = transpile_hw(qc)                      # <-- crucial: transpile to hardware ISA
+
+    t0 = time.time()
+    job = sampler.run([tqc], shots=SHOTS)
+    job_id = job.job_id()
+    res = job.result()
+    elapsed = time.time() - t0
+
+    counts = res[0].join_data().get_counts()
+    best_bitstring = max(counts, key=counts.get)
+    # Qiskit bitstrings are little-endian by default; reverse for x[0]..x[n-1]
+    x = np.array([int(b) for b in best_bitstring[::-1][:perf_n]])
+    val = maxcut_obj(x, W)
+
+    perf_records.append({
+        "instance_id": inst,
+        "n": perf_n,
+        "runtime_sec": elapsed,
+        "objective_value": float(val),
+        "job_id": job_id
+    })
+
+    # one graph per instance
+    gpath = os.path.join(OUT_PERF_DIR, f"maxcut_inst{inst}_{TS}.png")
+    plot_maxcut_graph(W, x, gpath, f"Performance instance {inst} (n={perf_n})")
+
+perf_df = pd.DataFrame(perf_records)
+perf_df.to_excel(PERF_XLS, index=False)
+
+plt.figure()
+plt.bar(perf_df["instance_id"], perf_df["runtime_sec"])
+plt.xlabel("Instance"); plt.ylabel("Runtime (s)")
+plt.title("Performance: Runtime per instance")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_PERF_DIR, f"perf_runtime_{TS}.png"), dpi=300)
+plt.close()
+
+# ------------********------------ Scalability Metrics
+
+#This section benchmarks scalability on hardware by timing QAOA-like executions for several problem sizes.
+#For each size, it runs two trials, transpiles quickly for speed, measures execution time, 
+# and stores the mean and standard deviation.
+#Results are saved to Excel and visualized in a runtime-vs-size plot for assessing growth in hardware execution cost.
+
+print("[Scalability] Measuring runtime vs size…")
+sizes = [4, 6, 8]            # keep modest on hardware
+scal_rows = []
+
+for n in sizes:
+    times = []
+    for k in range(2):
+        W = random_weighted_graph(n, 0.5, seed=k)
+        qc = build_simple_qaoa_like_circuit(W)
+        tqc = transpile_hw(qc, fast=True)      # faster transpile for quick loops
+        t0 = time.time()
+        job = sampler.run([tqc], shots=SHOTS); job.result()
+        times.append(time.time() - t0)
+    scal_rows.append({
+        "n": n,
+        "avg_runtime_sec": float(np.mean(times)),
+        "std_runtime_sec": float(np.std(times))
+    })
+
+scal_df = pd.DataFrame(scal_rows)
+scal_df.to_excel(SCAL_XLS, index=False)
+
+plt.figure()
+plt.plot(scal_df["n"], scal_df["avg_runtime_sec"], marker="o")
+plt.xlabel("n"); plt.ylabel("Runtime (s)")
+plt.title("Scalability: Runtime vs n")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_SCAL_DIR, f"scal_runtime_{TS}.png"), dpi=300)
+plt.close()
+
+# ------------********------------ Reliability Metrics
+
+#This code assesses reliability by repeatedly executing the same QAOA-like circuit on hardware and measuring stability of outcomes.
+#For each run, it records runtime and the fraction of counts associated with the most frequent 
+# bitstring as a simple reliability indicator.
+#It generates a plot showing consistency across runs, serving as a lightweight reliability proxy.
+
+print("[Reliability] Repeated runs on fixed problem…")
+reli_rows = []
+rel_n = 6
+W_rel = random_weighted_graph(rel_n, 0.5, seed=99)
+
+for run_id in range(5):
+    qc = build_simple_qaoa_like_circuit(W_rel)
+    tqc = transpile_hw(qc, fast=True)
+    t0 = time.time()
+    job = sampler.run([tqc], shots=SHOTS); res = job.result()
+    elapsed = time.time() - t0
+    counts = res[0].join_data().get_counts()
+    max_frac = max(counts.values())/sum(counts.values())
+    reli_rows.append({
+        "run_id": run_id,
+        "runtime_sec": elapsed,
+        "max_outcome_fraction": float(max_frac)
+    })
+
+reli_df = pd.DataFrame(reli_rows)
+reli_df.to_excel(RELI_XLS, index=False)
+
+plt.figure()
+plt.plot(reli_df["run_id"], reli_df["max_outcome_fraction"], marker="o")
+plt.xlabel("Run"); plt.ylabel("Max outcome fraction")
+plt.title("Reliability proxy")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_RELI_DIR, f"reliability_proxy_{TS}.png"), dpi=300)
+plt.close()
+
+
+# ------------********------------ Carbon Footprints
+
+#This block of code estimates carbon emissions by converting total hardware runtime into energy usage 
+# using assumed power, PUE, and grid intensity factors.
+#It stores the computed energy and CO₂-equivalent values in an Excel file
+# and visualizes the energy footprint as a simple bar plot.
+#A completion message then lists all generated Excel outputs, 
+#marking the end of the hardware QAOA benchmarking workflow.
+
+
+print("[Carbon] Estimating CO2e from Performance runtime…")
+total_runtime = float(perf_df["runtime_sec"].sum())
+# include PUE scaling
+energy_kWh = (ASSUMED_DEVICE_POWER_W * PUE_FACTOR) * (total_runtime / 3600.0) / 1000.0
+co2_kg = energy_kWh * GRID_INTENSITY_KG_PER_KWH
+
+carb_df = pd.DataFrame([{
+    "total_runtime_sec": total_runtime,
+    "device_power_W": ASSUMED_DEVICE_POWER_W,
+    "PUE": PUE_FACTOR,
+    "energy_kWh": round(energy_kWh, 6),
+    "CO2e_kg_est": round(co2_kg, 6)
+}])
+carb_df.to_excel(CARB_XLS, index=False)
+
+plt.figure()
+plt.bar(["Energy (kWh)"], [energy_kWh])
+plt.ylabel("kWh"); plt.title("Carbon: Energy from Performance runtime")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_CARB_DIR, f"carbon_energy_{TS}.png"), dpi=300)
+plt.close()
+
+print("\n=== IBM Hardware QAOA Benchmark — Done ===")
+print("Excel files:")
+for f in [PERF_XLS, SCAL_XLS, RELI_XLS, CARB_XLS]:
+    print(" -", f)

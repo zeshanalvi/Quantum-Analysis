@@ -1,0 +1,46 @@
+import os
+
+
+# python quantum_pendulum_tomography_noiseless.py ^
+#   --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+#   --device-power-watts 65 --pue 1.2 ^
+#   --year-select latest ^
+#   --outdir "%USERPROFILE%\\Desktop\\Tomography_Outputs\\Quantum" ^
+#   --combine --workers 4 ^
+#   --n-min 2 --n-max 6 --steps "8,16,32" --repeats 2 ^
+#   --shots-per-angle 1500 --grid 64 ^
+#   --state coherent --x0 0.8 --p0 -0.5 ^
+#   --squeeze-r 0.0 --squeeze-phi 0.0
+
+outdir = os.path.join(
+    os.environ.get("USERPROFILE", ""),
+    "Desktop",
+    "Tomography_Outputs",
+    "Quantum_IBM",   # you can change this if you want a different folder
+)
+
+results_tomo_ibm = run_pendulum_tomography_ibm_hardware_notebook(
+    n_min=2,
+    n_max=6,
+    steps=(8, 16, 32),
+    repeats=2,
+    shots_per_angle=1500,
+    grid=64,
+    seed=7,
+    state="coherent",
+    x0=0.8,
+    p0=-0.5,
+    squeeze_r=0.0,
+    squeeze_phi=0.0,
+    lim=3.0,
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir=outdir,
+    backend_name="ibm_torino",   # change to your IBM backend
+    hw_shots_per_angle=256,      # light hardware usage
+    hw_angles_max=8,             # up to 8 angles per S on hardware
+)
+
+results_tomo_ibm["perf_df"].head()

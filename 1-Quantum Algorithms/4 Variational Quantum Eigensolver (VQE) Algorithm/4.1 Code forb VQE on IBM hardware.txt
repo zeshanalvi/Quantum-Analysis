@@ -1,0 +1,900 @@
+
+# Light VQE-on-IBM-hardware script using SamplerV2 + SPSA.
+
+# ----------------------------------------------------------------------------------------------------------------
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports 
+
+from __future__ import annotations
+import os, time, math, tracemalloc, pathlib, warnings
+from dataclasses import dataclass
+from typing import List, Tuple, Dict
+
+
+#Checks whether a list of required Python packages is installed by attempting dynamic imports for each one.
+#Collects any missing packages and prints a helpful message instructing the user how to install them.
+#Avoids crashing during setup and ensures all dependencies are available before running the main workflow.
+
+def _ensure(pkgs: List[str]):
+    import importlib
+    missing = []
+    for p in pkgs:
+        try:
+            importlib.import_module(p)
+        except Exception:
+            missing.append(p)
+    if missing:
+        print(f"[setup] You may need to install: {missing}")
+        print("        e.g. pip install " + " ".join(missing))
+
+_ensure(["numpy", "pandas", "matplotlib", "openpyxl", "qiskit", "qiskit_ibm_runtime"])
+
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit import QuantumCircuit
+from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import SamplerV2 as Sampler
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+# ------------********------------- TFIM model ---------------------------------
+
+#Defines a dataclass for the Transverse-Field Ising Model, 
+# storing system size, couplings, and boundary conditions.
+#The exact energy function builds the full TFIM Hamiltonian matrix for small N,
+#   including ZZ interactions and transverse-field flips.
+#It diagonalizes the Hamiltonian and returns the ground-state energy, 
+#  or None if the system is too large to handle.
+
+@dataclass
+class TFIM:
+    N: int
+    J: float
+    h: float
+    periodic: bool = False
+
+def exact_tfim_energy(N: int, J: float, h: float, periodic: bool=False, max_dim: int=8192) -> float | None:
+    """Exact ground-state energy of 1D TFIM (small N only)."""
+    dim = 1 << N
+    if dim > max_dim:
+        return None
+    H = np.zeros((dim, dim), dtype=float)
+    for state in range(dim):
+        z = 1 - 2*np.array([(state >> i) & 1 for i in range(N)], dtype=int)
+        zz = int(np.sum(z[:-1]*z[1:]))
+        if periodic and N>1:
+            zz += int(z[-1]*z[0])
+        H[state, state] += -J * zz
+        for i in range(N):
+            H[state, state ^ (1<<i)] += -h
+    evals = np.linalg.eigvalsh(H)
+    return float(evals[0])
+
+# ------------********------------ Ansatz + measurement helpers 
+
+#Builds a hardware-efficient variational ansatz circuit using 
+#  layers of single-qubit RY rotations followed by CZ entanglers.
+#Implements linear connectivity (and optional periodic coupling) to mirror 
+#  the ansatz used in the noiseless simulation baseline.
+#Returns a Qiskit QuantumCircuit parameterized by the RY angles provided in *thetas*.
+
+def build_ansatz_circuit(N: int, thetas: np.ndarray, periodic: bool) -> QuantumCircuit:
+    """
+    Same ansatz structure as noiseless baseline:
+      For each layer l:
+        - RY(theta[l,q]) on each qubit q
+        - CZ(i,i+1) for i = 0..N-2
+        - optional CZ(N-1,0) if periodic
+    """
+    layers = thetas.shape[0]
+    qc = QuantumCircuit(N)
+    for l in range(layers):
+        for q in range(N):
+            qc.ry(float(thetas[l, q]), q)
+        for i in range(N-1):
+            qc.cz(i, i+1)
+        if periodic and N > 2:
+            qc.cz(N-1, 0)
+    return qc
+
+def _z_eigenvalue(bit: str) -> int:
+    """bit '0' -> +1, bit '1' -> -1."""
+    return +1 if bit == "0" else -1
+
+#Computes TFIM energy from hardware measurement counts by estimating ⟨ZᵢZᵢ₊₁⟩ from Z-basis shots 
+# and ⟨Xᵢ⟩ from X-basis shots (via H then Z).
+#Iterates through bitstrings to convert measured bits into ±1 eigenvalues, 
+#  accumulating weighted expectation values.
+#Combines both contributions to return the total TFIM energy along 
+#  with the individual ZZ and X expectation components.
+
+def hardware_energy_from_counts(counts_z, counts_x, N: int, J: float, h: float, periodic: bool):
+    """
+    Given:
+      - counts_z: measurements in Z basis
+      - counts_x: measurements in X basis (via H then Z)
+    compute:
+      E = -J * <Σ Z_i Z_{i+1}> - h * <Σ X_i>
+    """
+    total_z = sum(counts_z.values()) or 1
+    total_x = sum(counts_x.values()) or 1
+
+    # <Σ Z_i Z_{i+1}>
+    zz_sum = 0.0
+    for bitstring, c in counts_z.items():
+        contrib = 0.0
+        for i in range(N - 1):
+            zi = _z_eigenvalue(bitstring[-1 - i])
+            zj = _z_eigenvalue(bitstring[-1 - (i + 1)])
+            contrib += zi * zj
+        if periodic and N > 1:
+            z0 = _z_eigenvalue(bitstring[-1 - 0])
+            zlast = _z_eigenvalue(bitstring[-1 - (N - 1)])
+            contrib += z0 * zlast
+        zz_sum += contrib * c
+    zz_exp = zz_sum / float(total_z)
+
+    # <Σ X_i>
+    x_sum = 0.0
+    for bitstring, c in counts_x.items():
+        contrib = 0.0
+        for i in range(N):
+            xi = _z_eigenvalue(bitstring[-1 - i])  # H+Z -> X eigenvalue
+            contrib += xi
+        x_sum += contrib * c
+    x_exp = x_sum / float(total_x)
+
+    energy = -J * zz_exp - h * x_exp
+    return float(energy), float(zz_exp), float(x_exp)
+
+
+#The following function attempts to extract classical measurement counts from a SamplerV2 PubResult, 
+#  checking common register fields like `meas` or `c`.
+#Falls back to scanning all public attributes for any register object supporting `get_counts()`.
+#Raises an error if no suitable measurement container is found, 
+#  ensuring downstream energy calculation receives valid counts.
+
+def _extract_counts_from_pub_result(pub_result):
+    """
+    Try to extract combined counts from SamplerV2 PubResult.
+    Prefers data.meas.get_counts() or data.c.get_counts().
+    """
+    data = pub_result.data
+    if hasattr(data, "meas") and hasattr(data.meas, "get_counts"):
+        return dict(data.meas.get_counts())
+    if hasattr(data, "c") and hasattr(data.c, "get_counts"):
+        return dict(data.c.get_counts())
+    for name in dir(data):
+        if name.startswith("_"):
+            continue
+        reg = getattr(data, name)
+        if hasattr(reg, "get_counts"):
+            try:
+                return dict(reg.get_counts())
+            except Exception:
+                pass
+    raise RuntimeError("Could not extract counts from sampler result.")
+
+def hardware_vqe_energy(
+    sampler: Sampler,
+    pass_manager,
+    N: int,
+    J: float,
+    h: float,
+    periodic: bool,
+    thetas: np.ndarray,
+    shots: int,
+):
+    """
+    Evaluate VQE energy on real IBM hardware via SamplerV2.
+
+    Steps:
+      1. Build ansatz U(θ).
+      2. Create:
+         - qc_z: U(θ); measure_all()  (Z basis)
+         - qc_x: U(θ); H on all qubits; measure_all() (X basis)
+      3. Transpile both (generate_preset_pass_manager).
+      4. Run with SamplerV2, get counts.
+      5. Compute energy from counts.
+    """
+    ansatz = build_ansatz_circuit(N, thetas, periodic)
+
+    # Z basis circuit
+    qc_z = ansatz.copy()
+    qc_z.measure_all()
+
+    # X basis circuit
+    qc_x = ansatz.copy()
+    for q in range(N):
+        qc_x.h(q)
+    qc_x.measure_all()
+
+    # Transpile to ISA circuits
+    isa_qc_z = pass_manager.run(qc_z)
+    isa_qc_x = pass_manager.run(qc_x)
+
+    print(f"[hardware] Sampling 2 circuits (Z/X), shots={shots}")
+    job = sampler.run([isa_qc_z, isa_qc_x], shots=shots)
+    result = job.result()
+
+    pub_z = result[0]
+    pub_x = result[1]
+
+    counts_z = _extract_counts_from_pub_result(pub_z)
+    counts_x = _extract_counts_from_pub_result(pub_x)
+
+    E, zz_exp, x_exp = hardware_energy_from_counts(counts_z, counts_x, N, J, h, periodic)
+    print(f"[hardware]   E = {E:.6f} (ΣZZ={zz_exp:.6f}, ΣX={x_exp:.6f})")
+    return E, zz_exp, x_exp
+
+# ------------********------------  SPSA optimizer (light) ------------------
+
+#Runs SPSA-based VQE optimization on real hardware by perturbing parameters, 
+#  estimating gradients from two energy evaluations, and updating the ansatz angles.
+#Tracks convergence history, best energy, and applies optional early stopping based on tolerance and patience settings.
+#Returns final energy, runtime, gradient statistics, and the full optimization trace for downstream benchmarking and analysis.
+
+def optimize_vqe_hardware_spsa(
+    sampler: Sampler,
+    pass_manager,
+    N: int,
+    J: float,
+    h: float,
+    periodic: bool,
+    layers: int,
+    steps: int,
+    seed: int,
+    lr: float,
+    early_stop: bool,
+    patience: int,
+    min_delta: float,
+    shots: int,
+    a0: float = 0.1,
+    c0: float = 0.1,
+    alpha: float = 0.602,
+    gamma: float = 0.101,
+):
+    """
+    VQE optimizer using SPSA on hardware.
+
+    Each iteration k:
+      - sample random ±1 perturbation Δ
+      - evaluate E(θ + c_k Δ) and E(θ - c_k Δ)
+      - gradient estimate: ĝ ≈ (E+ - E-) / (2 c_k) * Δ
+      - update: θ_{k+1} = θ_k - lr * ĝ
+
+    Cost per iteration: only 2 energy evaluations (independent of #parameters).
+    """
+    rng = np.random.default_rng(seed)
+    thetas = 0.1 * rng.standard_normal((layers, N))
+
+    hist: List[float] = []
+    best_E = float("inf")
+    best_thetas = thetas.copy()
+    no_improve = 0
+
+    t0 = time.perf_counter()
+
+    for k in range(1, steps + 1):
+        print(f"\n[opt-SPSA] Iteration {k}/{steps} (N={N}, seed={seed})")
+
+        ak = a0 / (k ** alpha)
+        ck = c0 / (k ** gamma)
+
+        # random ±1 perturbation
+        delta = rng.choice([-1.0, 1.0], size=thetas.shape)
+
+        # E(θ + c_k Δ)
+        theta_plus = thetas + ck * delta
+        E_plus, _, _ = hardware_vqe_energy(
+            sampler, pass_manager, N, J, h, periodic, theta_plus, shots
+        )
+
+        # E(θ - c_k Δ)
+        theta_minus = thetas - ck * delta
+        E_minus, _, _ = hardware_vqe_energy(
+            sampler, pass_manager, N, J, h, periodic, theta_minus, shots
+        )
+
+        # SPSA gradient estimate
+        g_hat = (E_plus - E_minus) / (2.0 * ck) * delta
+
+        # update
+        thetas = thetas - lr * g_hat
+
+        # track current energy (average of E+ and E-)
+        E_curr = 0.5 * (E_plus + E_minus)
+        hist.append(float(E_curr))
+
+        if E_curr < best_E - min_delta:
+            best_E = float(E_curr)
+            best_thetas = thetas.copy()
+            no_improve = 0
+        else:
+            no_improve += 1
+            if early_stop and no_improve >= patience:
+                print(f"[opt-SPSA] Early stopping at iter {k}")
+                break
+
+    runtime = time.perf_counter() - t0
+
+    # Final evaluation at best_thetas
+    final_E, _, _ = hardware_vqe_energy(
+        sampler, pass_manager, N, J, h, periodic, best_thetas, shots
+    )
+    avg_grad_norm = float(np.linalg.norm(g_hat))
+
+    return {
+        "final_energy": float(final_E),
+        "history": [float(x) for x in hist],
+        "runtime_s": float(runtime),
+        "avg_grad_norm": avg_grad_norm,
+        "layers": layers,
+    }
+
+def run_single_hardware(
+    sampler: Sampler,
+    pass_manager,
+    N: int,
+    seed: int,
+    steps: int,
+    layers: int,
+    J: float,
+    h: float,
+    periodic: bool,
+    lr: float,
+    early_stop: bool,
+    patience: int,
+    min_delta: float,
+    shots: int,
+):
+    """
+    Single VQE run on hardware (one N, one seed) using SPSA.
+    """
+    print(f"\n[run_single] N={N}, seed={seed}, steps={steps}, layers={layers}")
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    res = optimize_vqe_hardware_spsa(
+        sampler=sampler,
+        pass_manager=pass_manager,
+        N=N,
+        J=J,
+        h=h,
+        periodic=periodic,
+        layers=layers,
+        steps=steps,
+        seed=seed,
+        lr=lr,
+        early_stop=early_stop,
+        patience=patience,
+        min_delta=min_delta,
+        shots=shots,
+        a0=0.1,
+        c0=0.1,
+        alpha=0.602,
+        gamma=0.101,
+    )
+
+    runtime = time.perf_counter() - t0
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # Initial energy at θ=0 (|0...0>) measured on hardware
+    init_thetas = np.zeros((layers, N))
+    init_energy, _, _ = hardware_vqe_energy(
+        sampler, pass_manager, N, J, h, periodic, init_thetas, shots
+    )
+
+    e_exact = exact_tfim_energy(N, J, h, periodic=periodic, max_dim=8192)
+    error = None if e_exact is None else float(res["final_energy"] - e_exact)
+
+    return {
+        "N": N,
+        "seed": seed,
+        "steps": steps,
+        "layers": layers,
+        "runtime_s": float(runtime),
+        "final_energy": float(res["final_energy"]),
+        "init_energy": float(init_energy),
+        "exact_energy": None if e_exact is None else float(e_exact),
+        "error": error,
+        "avg_grad_norm": float(res["avg_grad_norm"]),
+        "peak_mem_mb": float(peak / (1024 * 1024)),
+        "history": res["history"],
+    }
+
+# ------------********------------ Carbon handling --------------------------------
+
+def load_carbon_data_from_desktop(year_select: str="latest") -> pd.DataFrame:
+    """
+    Load carbon intensity data from Desktop.
+
+    Priority:
+      1) Filtered_CO2_intensity_236_Countries.csv
+      2) Filtered CO2 intensity 236 Countries.xlsx
+
+    Then:
+      - detect Country / Year / Intensity columns
+      - keep latest year per country
+      - normalize intensity to kgCO2/kWh
+    """
+    desktop = pathlib.Path.home() / "Desktop"
+    csv_path  = desktop / "Filtered_CO2_intensity_236_Countries.csv"
+    xlsx_path = desktop / "Filtered CO2 intensity 236 Countries.xlsx"
+
+    tried = []
+    if csv_path.exists():
+        print(f"[carbon] Loading CSV: {csv_path}")
+        df = pd.read_csv(csv_path)
+    elif xlsx_path.exists():
+        print(f"[carbon] Loading Excel: {xlsx_path}")
+        df = pd.read_excel(xlsx_path)
+    else:
+        tried = [str(csv_path), str(xlsx_path)]
+        raise FileNotFoundError(
+            "Could not find carbon file. Looked at:\n  " + "\n  ".join(tried)
+        )
+
+    cols = {c.lower(): c for c in df.columns}
+
+    cand_country = next((v for k,v in cols.items()
+                         if "country" in k or "nation" in k or k=="location"), None)
+    if cand_country is None:
+        raise ValueError("No 'Country' column found in carbon file.")
+
+    cand_year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    cand_intensity = next(
+        (v for k,v in cols.items()
+         if "intensity" in k
+         or ("co2" in k and ("kwh" in k or "/kwh" in k))
+         or "kgco2" in k
+         or "gco2" in k),
+        None,
+    )
+
+    if cand_intensity is None:
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if cand_year in numeric_cols:
+            numeric_cols.remove(cand_year)
+        if not numeric_cols:
+            raise ValueError("No numeric intensity column detected in carbon file.")
+        cand_intensity = numeric_cols[0]
+
+    keep = [cand_country] + ([cand_year] if cand_year else []) + [cand_intensity]
+    df = df[keep].copy()
+    df.columns = ["Country","Year","Intensity"] if len(keep)==3 else ["Country","Intensity"]
+
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country", as_index=False).tail(1)
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0  # gCO2/kWh -> kgCO2/kWh
+
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+def compute_carbon(
+    perf_df: pd.DataFrame,
+    intensity_df: pd.DataFrame,
+    power_watts: float,
+    pue: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute country-wise kgCO2e using total runtime from performance results.
+    """
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+
+    summary = pd.DataFrame({
+        "total_runtime_s":[total_runtime_s],
+        "power_watts":[power_watts],
+        "PUE":[pue],
+        "kWh_total":[kWh_total],
+        "median_intensity_kg_per_kWh":[float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries":[float(df["kgCO2e"].mean())],
+    })
+
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ------------********------------ plotting helpers ----------------------
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def plot_performance(perf_df, histories, outdir):
+    g = perf_df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure(); plt.plot(g["N"], g["runtime_s"], marker="o")
+    plt.xlabel("System size N"); plt.ylabel("Mean runtime (s)")
+    plt.title("Performance: Runtime vs N (hardware, SPSA)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_runtime_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = perf_df.groupby("N")["final_energy"].agg(["mean","std"]).reset_index()
+    plt.figure(); plt.errorbar(g2["N"], g2["mean"], yerr=g2["std"], fmt="-o")
+    plt.xlabel("System size N"); plt.ylabel("Final energy (mean±std)")
+    plt.title("Performance: Final energy vs N (hardware, SPSA)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_energy_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    sub = perf_df.dropna(subset=["error"])
+    if not sub.empty:
+        g3 = sub.groupby("N")["error"].agg(["mean","std"]).reset_index()
+        plt.figure(); plt.errorbar(g3["N"], g3["mean"], yerr=g3["std"], fmt="-o")
+        plt.xlabel("System size N (exact available)")
+        plt.ylabel("Energy error (mean±std)")
+        plt.title("Performance: Energy error vs N (hardware, SPSA)")
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(outdir, "perf_error_vs_N.png"), **plt_kwargs)
+        plt.close()
+
+    maxN = int(perf_df["N"].max())
+    seeds = sorted(perf_df[perf_df["N"]==maxN]["seed"].unique())
+    if seeds:
+        s = seeds[0]
+        key = (maxN, s)
+        if key in histories:
+            plt.figure()
+            plt.plot(range(1, len(histories[key])+1), histories[key])
+            plt.xlabel("Iteration"); plt.ylabel("Energy")
+            plt.title(f"Performance: Convergence N={maxN}, seed={s} (hardware, SPSA)")
+            plt.grid(True, alpha=0.3)
+            plt.savefig(os.path.join(outdir, f"perf_convergence_N{maxN}_seed{s}.png"), **plt_kwargs)
+            plt.close()
+
+def plot_scalability(perf_df, outdir):
+    g = perf_df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure(); plt.plot(g["N"], g["runtime_s"], marker="o")
+    plt.xlabel("System size N"); plt.ylabel("Mean runtime (s)")
+    plt.title("Scalability: Runtime vs N (hardware, SPSA)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_runtime_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = perf_df.groupby("N")["peak_mem_mb"].mean().reset_index()
+    plt.figure(); plt.plot(g2["N"], g2["peak_mem_mb"], marker="s")
+    plt.xlabel("System size N"); plt.ylabel("Peak memory (MB)")
+    plt.title("Scalability: Peak memory vs N (hardware, SPSA)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_peakmem_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g3 = perf_df.copy()
+    g3["rt_per_iter"] = g3["runtime_s"] / g3["steps"]
+    g3 = g3.groupby("N")["rt_per_iter"].mean().reset_index()
+    plt.figure(); plt.plot(g3["N"], g3["rt_per_iter"], marker="^")
+    plt.xlabel("System size N"); plt.ylabel("Runtime per iteration (s)")
+    plt.title("Scalability: Runtime/iter vs N (hardware, SPSA)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_rt_per_iter_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g4 = perf_df.groupby("N")["avg_grad_norm"].mean().reset_index()
+    plt.figure(); plt.plot(g4["N"], g4["avg_grad_norm"], marker="d")
+    plt.xlabel("System size N"); plt.ylabel("Avg grad norm")
+    plt.title("Scalability: Gradient norm vs N (hardware, SPSA)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_gradnorm_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+def plot_reliability(perf_df, outdir):
+    plt.figure()
+    data = [perf_df[perf_df["N"]==N]["final_energy"].values for N in sorted(perf_df["N"].unique())]
+    _boxplot_with_labels(data, labels=sorted(perf_df["N"].unique()))
+    plt.xlabel("System size N"); plt.ylabel("Final energy distribution")
+    plt.title("Reliability: Final energy variability (hardware, SPSA)")
+    plt.grid(True, axis='y', alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_boxplot_final_energy.png"), **plt_kwargs)
+    plt.close()
+
+    g = perf_df.groupby("N")["final_energy"].std().reset_index()
+    plt.figure(); plt.plot(g["N"], g["final_energy"], marker="o")
+    plt.xlabel("System size N"); plt.ylabel("Std dev of final energy")
+    plt.title("Reliability: Std dev vs N (hardware, SPSA)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_std_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = perf_df.groupby("N")["success"].mean().reset_index(name="success_rate")
+    plt.figure(); plt.plot(g2["N"], g2["success_rate"], marker="s")
+    plt.ylim(0,1)
+    plt.xlabel("System size N"); plt.ylabel("Success rate")
+    plt.title("Reliability: Success rate vs N (hardware, SPSA)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_success_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    piv = perf_df.pivot_table(index="seed", columns="N", values="final_energy")
+    plt.figure(); plt.imshow(piv.values, aspect='auto')
+    plt.colorbar(label="Final energy")
+    plt.yticks(range(len(piv.index)), piv.index)
+    plt.xticks(range(len(piv.columns)), piv.columns)
+    plt.xlabel("N"); plt.ylabel("seed")
+    plt.title("Reliability: seed×N final energy heatmap (hardware, SPSA)")
+    plt.savefig(os.path.join(outdir, "rel_heatmap_seed_N.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------ Main driver --------------------------------
+
+def run_vqe_ibm_hardware_notebook(
+    sizes=(2,),                 # very small default: N=2
+    steps=3,                    # few iterations
+    layers=1,                   # minimal ansatz
+    seeds_per_N=1,              # single seed
+    lr=0.05,
+    J=1.0,
+    h=1.05,
+    periodic=False,
+    early_stop=True,
+    patience=2,
+    min_delta=1e-3,
+    backend_name=None,
+    shots=256,                  # small shot count
+    device_power_watts=65.0,
+    pue=1.2,
+):
+    """
+    Light-weight VQE run on IBM hardware using SamplerV2 + SPSA.
+
+    - Uses performance runtimes to compute carbon (country-wise, latest year).
+    - Loads carbon file from Desktop (csv or xlsx).
+    - Writes Excel + PNG outputs to Desktop.
+    """
+    from IPython.display import display
+
+    sizes = sorted(set(int(n) for n in sizes))
+    periodic = bool(periodic)
+
+    # Desktop output folders
+    desktop = pathlib.Path.home() / "Desktop"
+    perf_dir = desktop / "Performance"
+    scal_dir = desktop / "Scalability"
+    rel_dir  = desktop / "Reliability"
+    carb_root = desktop / "Carbon footprints"
+    carb_dir  = carb_root / "carbon_by_country"
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print("[ibm] Initializing QiskitRuntimeService (using saved account)...")
+    service = QiskitRuntimeService()
+    backends = service.backends()
+    real_qpus = [b for b in backends if not getattr(b, "simulator", False)]
+
+    if backend_name is not None:
+        backend = service.backend(backend_name)
+    else:
+        if not real_qpus:
+            raise RuntimeError("No non-simulator IBM backends available for this account.")
+        backend = real_qpus[0]
+        backend_name = backend.name
+
+    print(f"[ibm] Using backend: {backend_name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+    print("[run] sizes:", sizes, "| steps:", steps, "| layers:", layers, "| seeds_per_N:", seeds_per_N)
+
+    # Transpiler pass manager for this backend
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+
+    # SamplerV2 bound to this backend
+    sampler = Sampler(mode=backend)
+    try:
+        sampler.options.default_shots = shots
+    except Exception:
+        pass
+
+    # Job list
+    jobs = [(N, 1000 + 13 * N + s) for N in sizes for s in range(seeds_per_N)]
+    all_rows = []
+    histories: Dict[Tuple[int,int], List[float]] = {}
+
+    for (N, seed) in jobs:
+        row = run_single_hardware(
+            sampler=sampler,
+            pass_manager=pm,
+            N=N,
+            seed=seed,
+            steps=steps,
+            layers=layers,
+            J=J,
+            h=h,
+            periodic=periodic,
+            lr=lr,
+            early_stop=early_stop,
+            patience=patience,
+            min_delta=min_delta,
+            shots=shots,
+        )
+        all_rows.append(row)
+        histories[(row["N"], row["seed"])] = row["history"]
+        print(f"  - done N={row['N']}, seed={row['seed']} (runtime={row['runtime_s']:.2f}s)")
+
+    perf_df = pd.DataFrame(all_rows)
+
+    # -------- NEW success metric: improvement vs init_energy --------
+    # On real noisy hardware, with very few steps, we don't require
+    # closeness to exact ground state. Instead:
+    #
+    # success = final_energy at least 5% lower (more negative) than init_energy.
+
+    def success(row):
+        return (row["init_energy"] - row["final_energy"]) >= 0.05 * abs(row["init_energy"])
+
+    perf_df["success"] = perf_df.apply(success, axis=1)
+
+# ------------********------------
+    # -------- Performance Excel + plots --------
+
+    perf_excel = perf_dir / "performance_results.xlsx"
+    perf_agg = perf_df.groupby("N").agg(
+        runtime_s=("runtime_s","mean"),
+        final_energy=("final_energy","mean"),
+        error=("error","mean"),
+        avg_grad_norm=("avg_grad_norm","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_excel, engine="openpyxl") as w:
+            perf_df.drop(columns=["history"]).to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(perf_df, histories, str(perf_dir))
+
+# ------------********------------
+    # -------- Scalability --------
+
+    scal_excel = scal_dir / "scalability_results.xlsx"
+    scal_agg = perf_df.groupby("N").agg(
+        runtime_s=("runtime_s","mean"),
+        peak_mem_mb=("peak_mem_mb","mean"),
+        steps=("steps","mean"),
+        layers=("layers","mean"),
+        avg_grad_norm=("avg_grad_norm","mean"),
+    ).reset_index()
+    scal_agg["rt_per_iter"] = scal_agg["runtime_s"]/scal_agg["steps"]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_excel, engine="openpyxl") as w:
+            perf_df[["N","seed","runtime_s","peak_mem_mb","steps","layers","avg_grad_norm"]].to_excel(
+                w, index=False, sheet_name="from_perf_runs"
+            )
+            scal_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_scalability(perf_df, str(scal_dir))
+
+# ------------********------------
+    # -------- Reliability --------
+
+    rel_excel = rel_dir / "reliability_results.xlsx"
+    rel_agg = perf_df.groupby("N").agg(
+        mean_final=("final_energy","mean"),
+        std_final=("final_energy","std"),
+        success_rate=("success","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_excel, engine="openpyxl") as w:
+            perf_df[["N","seed","final_energy","init_energy","exact_energy","success"]].to_excel(
+                w, index=False, sheet_name="runs_with_success"
+            )
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability(perf_df, str(rel_dir))
+
+# ------------********------------
+    # -------- Carbon (latest year per country) based on PERFORMANCE runtimes --------
+
+    intensity_df = load_carbon_data_from_desktop(year_select="latest")
+
+    carbon_df, summary_df = compute_carbon(
+        perf_df,
+        intensity_df,
+        power_watts=device_power_watts,
+        pue=pue,
+    )
+
+    carb_excel = carb_dir / "carbon_results.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(carb_excel, engine="openpyxl") as w:
+            carbon_df.to_excel(w, index=False, sheet_name="per_country_latest_year")
+            summary_df.to_excel(w, index=False, sheet_name="summary")
+            intensity_df.to_excel(w, index=False, sheet_name="intensity_input_latest")
+
+    # Carbon plots
+    top = carbon_df.nlargest(10, "kgCO2e")
+    plt.figure(figsize=(8,5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.xlabel("kg CO2e"); plt.title("Carbon: Top 10 countries (kgCO2e)")
+    plt.tight_layout()
+    plt.savefig(carb_dir / "carbon_top10.png", **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(carbon_df["kgCO2e"], bins=20)
+    plt.xlabel("kg CO2e (per country)"); plt.title("Carbon: Emission distribution")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(carb_dir / "carbon_distribution.png", **plt_kwargs)
+    plt.close()
+
+    xs = np.sort(carbon_df["kgCO2e"].values)
+    ys = np.arange(1, len(xs) + 1) / len(xs)
+    plt.figure()
+    plt.plot(xs, ys)
+    plt.xlabel("kg CO2e"); plt.ylabel("CDF")
+    plt.title("Carbon: CDF (countries)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(carb_dir / "carbon_cdf.png", **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+    # -------- Notebook summary --------
+
+    #Prints a clean summary of all benchmark outputs, including backend info and paths to generated Excel files and result folders.
+#Displays country-wise carbon computations for quick inspection directly inside the notebook environment.
+#Returns a structured dictionary aggregating dataframes and output directories, enabling downstream automated analysis or reporting.
+
+    print("\n[summary] Backend used:", backend_name)
+    print("[summary] Performance Excel:", perf_excel)
+    print("[summary] Scalability Excel:", scal_excel)
+    print("[summary] Reliability Excel:", rel_excel)
+    print("[summary] Carbon Excel:", carb_excel)
+    print("[summary] Output folders on Desktop:")
+    print("  -", perf_dir)
+    print("  -", scal_dir)
+    print("  -", rel_dir)
+    print("  -", carb_dir)
+
+    print("\n[carbon] Country-wise carbon results (latest year per country):")
+    display(carbon_df)
+
+    return {
+        "perf_df": perf_df,
+        "carbon_df": carbon_df,
+        "summary_df": summary_df,
+        "backend_name": backend_name,
+        "folders": {
+            "performance": perf_dir,
+            "scalability": scal_dir,
+            "reliability": rel_dir,
+            "carbon": carb_dir,
+        },
+    }

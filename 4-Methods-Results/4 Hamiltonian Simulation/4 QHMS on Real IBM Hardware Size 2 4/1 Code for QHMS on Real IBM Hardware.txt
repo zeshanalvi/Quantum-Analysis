@@ -1,0 +1,745 @@
+# quantum_hamiltonian_sim_ibm_hardware_light_notebook.py
+#
+# Quantum Hamiltonian Simulation (Transverse-Field Ising) — IBM hardware (lightweight)
+#
+# - Uses the SAME ideal Trotter code as quantum_hamiltonian_sim_noiseless.py
+#   to compute all metrics:
+#       accuracy_mean, rmse_mean, success, exp_ops_total, runtime_s, peak_mem_mb.
+# - For each N, runs ONE small Trotter circuit on a real IBM backend via SamplerV2
+#   (with reduced Trotter steps) to get:
+#       hardware_runtime_s, hardware_circuit_depth, hardware_r_hw, hardware_shots.
+# - Carbon uses:
+#     runtime_s = host_runtime_s + hardware_runtime_s (for the first trial per N)
+#     runtime_s = host_runtime_s                       (for other trials)
+#
+# Output folders (current working directory):
+#   Performance/
+#   Scalability/
+#   Reliability/
+#   Carbon footprints/<outdir>/
+#
+# Notebook entry:
+#   results_qhsim_ibm = run_qhsim_ibm_hardware_notebook(...)
+#   results_qhsim_ibm["perf_df"].head()
+
+import os, time, math, warnings, pathlib, tracemalloc
+from typing import List, Dict
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+
+# ============================== Ideal simulator (copied from noiseless) ==============================
+
+def _idx_arrays(n):
+    dim = 1 << n
+    idx = np.arange(dim, dtype=np.int64)
+    return dim, idx
+
+def _apply_rx_qubit(state: np.ndarray, n: int, q: int, theta: float):
+    """
+    Apply Rx(theta) = exp(-i theta X / 2) on qubit q of an n-qubit statevector.
+    Vectorized via bit-masks.
+    """
+    mask = 1 << q
+    dim = state.size
+    idx = np.arange(dim, dtype=np.int64)
+    idx0 = idx[(idx & mask) == 0]
+    idx1 = idx0 | mask
+    c = math.cos(theta/2.0)
+    s = math.sin(theta/2.0)
+    a = state[idx0].copy()
+    b = state[idx1].copy()
+    # Rx: [c  -i s; -i s  c]
+    state[idx0] = c*a - 1j*s*b
+    state[idx1] = c*b - 1j*s*a
+
+def _precompute_zz_phase(n: int, pair, theta: float, idx: np.ndarray):
+    """
+    For Z_i Z_j rotation with angle theta': exp(-i theta' Z_i Z_j).
+    For computational basis |z>, phase = exp(-i theta' * z_i z_j), with z∈{+1,-1}.
+    Returns a vector 'phase' of shape (2^n,) to multiply elementwise.
+    """
+    i, j = pair
+    zi = 1 - 2*((idx >> i) & 1)  # +1 if bit=0, -1 if bit=1
+    zj = 1 - 2*((idx >> j) & 1)
+    sgn = zi * zj
+    return np.exp(-1j * theta * sgn)
+
+def _apply_phase_layer(state: np.ndarray, phase: np.ndarray):
+    state *= phase
+
+def simulate_trotter(n: int, T: float, r: int, order: int, J: float, h: float,
+                     periodic: bool, init_state: np.ndarray,
+                     cache=None):
+    """
+    Simulate e^{-i H T} |psi> by a product formula with r steps.
+    H = J sum Z_iZ_{i+1} + h sum X_i (matches noiseless code implementation).
+    order: 1 (Lie-Trotter) or 2 (Strang)
+    cache: dict to reuse precomputed phase vectors for ZZ layer.
+    """
+    state = init_state.copy()
+    dim, idx = _idx_arrays(n)
+
+    # neighbor pairs for ZZ
+    pairs = [(i, i+1) for i in range(n-1)]
+    if periodic and n >= 2:
+        pairs.append((n-1, 0))
+
+    dt = T / max(1, r)
+    # angles
+    theta_x = 2.0 * h * dt       # e^{-i h dt X} = Rx(2 h dt)
+    theta_zz = J * dt            # e^{-i J dt Z Z}
+
+    # Precompute ZZ phase vectors once
+    if cache is None:
+        cache = {}
+    key = (n, periodic, J, dt)
+    if key not in cache:
+        phase_list = [ _precompute_zz_phase(n, pr, theta_zz, idx) for pr in pairs ]
+        cache[key] = phase_list
+    phase_list = cache[key]
+
+    # One step kernels
+    def layer_X_half():
+        th = theta_x/2.0
+        for q in range(n):
+            _apply_rx_qubit(state, n, q, th)
+    def layer_X_full():
+        for q in range(n):
+            _apply_rx_qubit(state, n, q, theta_x)
+    def layer_ZZ_full():
+        for ph in phase_list:
+            _apply_phase_layer(state, ph)
+
+    # Evolve
+    if order == 1:
+        for _ in range(r):
+            layer_ZZ_full()
+            layer_X_full()
+    else:  # order==2
+        for _ in range(r):
+            layer_X_half()
+            layer_ZZ_full()
+            layer_X_half()
+
+    # Normalize (protect from tiny numerical drift)
+    norm = np.linalg.norm(state)
+    if norm == 0:
+        return state
+    return state / norm
+
+def random_state(n: int, rng: np.random.Generator) -> np.ndarray:
+    dim = 1 << n
+    a = rng.normal(size=dim) + 1j*rng.normal(size=dim)
+    a /= np.linalg.norm(a)
+    return a.astype(np.complex128)
+
+def run_single_ideal(N: int, steps: int, seed: int,
+                     T: float, r_steps: int, order: int,
+                     J: float, h: float, periodic: int,
+                     acc_tol: float, ref_mult: int) -> dict:
+    """
+    EXACTLY the same as run_single(...) in quantum_hamiltonian_sim_noiseless.py,
+    but packaged for notebook use.
+    """
+    rng = np.random.default_rng(seed)
+    periodic = bool(periodic)
+    order = int(order)
+    r_steps = int(r_steps)
+    r_ref = max(1, int(ref_mult) * max(1, r_steps))
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    # Coarse simulation runtime only
+    cache_coarse = {}
+    cache_ref = {}
+    fid_sum = 0.0
+    rmse_sum = 0.0
+
+    # Measure coarse-only wall time
+    for _ in range(steps):
+        psi0 = random_state(N, rng)
+        _ = simulate_trotter(N, T, r_steps, order, J, h, periodic, psi0, cache=cache_coarse)
+    runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # Accuracy vs reference (not counted in runtime)
+    for _ in range(steps):
+        psi0 = random_state(N, rng)
+        psi_coarse = simulate_trotter(N, T, r_steps, order, J, h, periodic, psi0, cache=cache_coarse)
+        psi_ref    = simulate_trotter(N, T, r_ref,   2,     J, h, periodic, psi0, cache=cache_ref)
+        inner = np.vdot(psi_ref, psi_coarse)
+        fid = float(np.abs(inner)**2)
+        err = float(np.sqrt(np.mean(np.abs(psi_ref - psi_coarse)**2)))
+        fid_sum += fid
+        rmse_sum += err
+
+    accuracy_mean = fid_sum / max(1, steps)
+    rmse_mean = rmse_sum / max(1, steps)
+
+    # Work units (coarse only): number of exponentials per Trotter step
+    zz_ops = N if periodic and N>=2 else max(0, N-1)
+    x_ops = N
+    if order == 1:
+        exp_per_step = zz_ops + x_ops
+    else:
+        exp_per_step = zz_ops + 2*x_ops
+    ops_total = exp_per_step * steps * r_steps
+
+    success = bool(accuracy_mean >= acc_tol)
+
+    return {
+        "N": int(N),
+        "steps": int(steps),
+        "seed": int(seed),
+        "T": float(T),
+        "r_steps": int(r_steps),
+        "order": int(order),
+        "J": float(J),
+        "h": float(h),
+        "periodic": int(periodic),
+        "ref_mult": int(ref_mult),
+        "accuracy_mean": float(accuracy_mean),
+        "rmse_mean": float(rmse_mean),
+        "success": success,
+        "runtime_s": float(runtime),          # coarse runtime
+        "host_runtime_s": float(runtime),     # alias (for hardware adjustments)
+        "peak_mem_mb": float(peak / (1024**2)),
+        "exp_ops_total": int(ops_total),
+    }
+
+
+# ============================== IBM hardware Trotter (1 run per N) ==============================
+
+def build_trotter_circuit(
+    N: int,
+    T: float,
+    r_hw: int,
+    order: int,
+    J: float,
+    h: float,
+    periodic: bool,
+) -> QuantumCircuit:
+    """
+    Build a gate-based Trotter circuit for the same Hamiltonian and order as the ideal code,
+    but with r_hw steps (kept small for hardware).
+      - Initial state |0...0>
+      - Trotter steps:
+          order=1: [ZZ layer] [X full layer]
+          order=2: [X half] [ZZ full] [X half]
+      - ZZ layer uses RZZ(2 * J * dt) per pair (i,i+1).
+    """
+    n = int(N)
+    qc = QuantumCircuit(n, n)
+    qubits = list(range(n))
+
+    r_hw = max(1, int(r_hw))
+    dt = float(T) / float(r_hw)
+
+    theta_x = 2.0 * h * dt
+    theta_zz = J * dt
+
+    # neighbor pairs
+    pairs = [(i, i+1) for i in range(n-1)]
+    if periodic and n >= 2:
+        pairs.append((n-1, 0))
+
+    def layer_X(angle):
+        for q in qubits:
+            qc.rx(angle, q)
+
+    def layer_ZZ():
+        for (i, j) in pairs:
+            # e^{-i theta_zz Z_iZ_j} = RZZ(2*theta_zz)
+            qc.rzz(2.0 * theta_zz, i, j)
+
+    if order == 1:
+        for _ in range(r_hw):
+            layer_ZZ()
+            layer_X(theta_x)
+    else:  # order==2 (Strang)
+        half = theta_x / 2.0
+        for _ in range(r_hw):
+            layer_X(half)
+            layer_ZZ()
+            layer_X(half)
+
+    qc.measure(qubits, qubits)
+    return qc
+
+def get_ibm_sampler(backend_name: str, shots: int):
+    """
+    Initialize QiskitRuntimeService and a SamplerV2 primitive for the given backend.
+    Assumes your IBM account is already saved.
+    """
+    print("[ibm] Initializing QiskitRuntimeService...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = SamplerV2(mode=backend)
+    return backend, sampler, pm
+
+def hardware_hsim_single(
+    N: int,
+    T: float,
+    r_steps: int,
+    order: int,
+    J: float,
+    h: float,
+    periodic: int,
+    backend,
+    sampler: SamplerV2,
+    pass_manager,
+    shots: int,
+    hardware_trotter_steps: int,
+) -> dict:
+    """
+    Run ONE Trotterized Hamiltonian simulation circuit on IBM hardware:
+
+      - Uses N qubits (if backend has enough; otherwise returns zeros and warns).
+      - Uses r_hw = min(r_steps, hardware_trotter_steps) Trotter steps.
+      - Measures all qubits once; we only record timing + circuit depth.
+    """
+    n_qubits = int(N)
+    periodic_bool = bool(periodic)
+    shots = int(shots)
+
+    if backend.num_qubits < n_qubits:
+        print(f"[hsim-ibm-light] WARNING: backend {backend.name} has only {backend.num_qubits} qubits, "
+              f"but N={N} is requested. Skipping hardware run for this N.")
+        return {
+            "hardware_runtime_s": 0.0,
+            "hardware_circuit_depth": 0,
+            "hardware_qubits": n_qubits,
+            "hardware_r_hw": 0,
+            "hardware_shots": shots,
+            "hardware_counts_total": 0,
+        }
+
+    r_hw = max(1, min(int(r_steps), int(hardware_trotter_steps)))
+
+    qc = build_trotter_circuit(
+        N=n_qubits,
+        T=T,
+        r_hw=r_hw,
+        order=order,
+        J=J,
+        h=h,
+        periodic=periodic_bool,
+    )
+
+    isa_circs = pass_manager.run([qc])
+    depth = isa_circs[0].depth()
+
+    print(f"[hsim-ibm-light] Submitting 1 Trotter circuit (N={N}, r_hw={r_hw}, order={order}) "
+          f"to backend {backend.name}...")
+    t0_hw = time.perf_counter()
+    job = sampler.run(isa_circs, shots=shots)
+    primitive_result = job.result()
+    hw_runtime = time.perf_counter() - t0_hw
+    print(f"[hsim-ibm-light] Hardware job finished in {hw_runtime:.3f} s.")
+
+    pub_res = primitive_result[0]
+    joined = pub_res.join_data()
+    counts = joined.get_counts()
+    total_counts = sum(counts.values())
+
+    return {
+        "hardware_runtime_s": float(hw_runtime),
+        "hardware_circuit_depth": int(depth),
+        "hardware_qubits": n_qubits,
+        "hardware_r_hw": int(r_hw),
+        "hardware_shots": shots,
+        "hardware_counts_total": int(total_counts),
+    }
+
+
+# ============================== Carbon helpers (Desktop + latest year) ==============================
+
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+    return str(p)
+
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+    df = pd.read_excel(path)
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k,v in cols.items() if "country" in k or "nation" in k or k=="location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found in Excel.")
+    year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k,v in cols.items()
+                      if "intensity" in k
+                      or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k
+                      or "gco2" in k), None)
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column detected.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country","Year","Intensity"] if len(keep)==3 else ["Country","Intensity"]
+
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country", as_index=False).tail(1)
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0  # g/kWh -> kg/kWh
+
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+def compute_carbon(perf_df: pd.DataFrame, intensity_df: pd.DataFrame,
+                   power_watts: float, pue: float):
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "power_watts": [power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+
+# ============================== Plotting helpers (same style as noiseless) ==============================
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)  # Matplotlib ≥3.9
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+def plot_performance(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure(); plt.plot(g["N"], g["runtime_s"], marker="o")
+    plt.title("Quantum H-Sim (IBM light) Performance: Runtime vs N")
+    plt.xlabel("qubits N"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_runtime_vs_N_qhsim_ibm_light.png"), **plt_kwargs); plt.close()
+
+    g2 = df.groupby("N")["exp_ops_total"].mean().reset_index()
+    plt.figure(); plt.plot(g2["N"], g2["exp_ops_total"], marker="s")
+    plt.title("Quantum H-Sim (IBM light) Performance: Exponential ops vs N")
+    plt.xlabel("qubits N"); plt.ylabel("Mean #exp ops (coarse)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_ops_vs_N_qhsim_ibm_light.png"), **plt_kwargs); plt.close()
+
+def plot_scalability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure(); plt.loglog(g["N"], g["runtime_s"], "o")
+    plt.title("Quantum H-Sim (IBM light) Scalability: Runtime (log–log) vs N")
+    plt.xlabel("qubits N"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_loglog_runtime_vs_N_qhsim_ibm_light.png"), **plt_kwargs); plt.close()
+
+    g2 = df.groupby("N")["peak_mem_mb"].mean().reset_index()
+    plt.figure(); plt.plot(g2["N"], g2["peak_mem_mb"], marker="^")
+    plt.title("Quantum H-Sim (IBM light) Scalability: Peak memory vs N")
+    plt.xlabel("qubits N"); plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_peakmem_vs_N_qhsim_ibm_light.png"), **plt_kwargs); plt.close()
+
+def plot_reliability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["accuracy_mean"].mean().reset_index()
+    plt.figure(); plt.plot(g["N"], g["accuracy_mean"], marker="o"); plt.ylim(0,1.05)
+    plt.title("Quantum H-Sim (IBM light) Reliability: Mean fidelity vs N")
+    plt.xlabel("qubits N"); plt.ylabel("Mean fidelity")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_fidelity_vs_N_qhsim_ibm_light.png"), **plt_kwargs); plt.close()
+
+    data = [df[df["N"]==k]["accuracy_mean"].values for k in sorted(df["N"].unique())]
+    plt.figure(); _boxplot_with_labels(data, labels=sorted(df["N"].unique()))
+    plt.title("Quantum H-Sim (IBM light) Reliability: Fidelity distribution by N")
+    plt.xlabel("qubits N"); plt.ylabel("Fidelity")
+    plt.grid(True, axis='y', alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_fidelity_boxplot_qhsim_ibm_light.png"), **plt_kwargs); plt.close()
+
+def plot_carbon(carbon_df: pd.DataFrame, outdir: str):
+    top = carbon_df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8,5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Carbon: Top 15 countries (kgCO2e) — Quantum H-Sim IBM (light)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "carbon_top15_qhsim_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(carbon_df["kgCO2e"], bins=30)
+    plt.title("Carbon: Emission distribution — Quantum H-Sim IBM (light)")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "carbon_distribution_qhsim_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+
+# ============================== Notebook entry point ==============================
+
+def run_qhsim_ibm_hardware_notebook(
+    sizes=(2, 8, 16, 32),
+    steps: int = 50,
+    trials: int = 10,
+    time: float = 1.0,
+    trotter_steps: int = 100,
+    order: int = 2,
+    J: float = 1.0,
+    h: float = 1.0,
+    periodic: int = 0,
+    acc_tol: float = 0.90,
+    ref_mult: int = 20,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = "carbon_by_country",
+    backend_name: str = "ibm_torino",
+    shots: int = 256,
+    hardware_trotter_steps: int = 5,  # keep hardware circuits shallow
+):
+    """
+    Run Quantum Hamiltonian Simulation benchmarks with IBM hardware in the loop (lightweight).
+
+    Parameters mirror your CLI:
+      sizes            : list/tuple of qubit counts N (e.g., 2, 8, 16, 32)
+      steps            : random initial states per (N, seed) batch
+      trials           : seeds per N
+      time             : total evolution time T
+      trotter_steps    : coarse Trotter steps r (ideal simulator)
+      order            : product formula order (1 or 2)
+      J, h             : Ising coupling and transverse field
+      periodic         : 0/1 for open/periodic boundary
+      acc_tol          : success if mean fidelity ≥ acc_tol
+      ref_mult         : reference uses ref_mult × trotter_steps, order=2
+      excel_filename   : CO2 Excel (looked up on Desktop or as path)
+      device_power_watts : power for carbon accounting (keep 65.0)
+      pue              : PUE (keep 1.2)
+      year_select      : "latest" selects last year per country
+      outdir           : subfolder under "Carbon footprints/"
+      backend_name     : IBM backend name (e.g., "ibm_torino")
+      shots            : shots for the single hardware Trotter circuit per N
+      hardware_trotter_steps : max Trotter steps used on hardware (kept small)
+    """
+    sizes = list(sizes)
+    T = float(time)
+    r_steps = int(trotter_steps)
+
+    print("[qhsim-ibm-light] Quantum Hamiltonian Simulation IBM benchmark (lightweight)")
+    print("  sizes (N):", sizes)
+    print(f"  steps={steps}, trials={trials}, T={T}, r_steps={r_steps}, order={order}")
+    print(f"  J={J}, h={h}, periodic={periodic}, acc_tol={acc_tol}, ref_mult={ref_mult}")
+    print(f"  backend={backend_name}, shots={shots}, hardware_trotter_steps={hardware_trotter_steps}")
+    print(f"  excel_filename={excel_filename}")
+    print(f"  power={device_power_watts} W, PUE={pue}, year_select={year_select}, outdir='{outdir}'")
+
+    # Output folders
+    cwd = pathlib.Path.cwd()
+    perf_dir = cwd / "Performance"
+    scal_dir = cwd / "Scalability"
+    rel_dir  = cwd / "Reliability"
+    carb_root = cwd / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_root, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print("  Output folders:")
+    print(f"    Performance -> {perf_dir}")
+    print(f"    Scalability -> {scal_dir}")
+    print(f"    Reliability -> {rel_dir}")
+    print(f"    Carbon      -> {carb_dir}")
+
+    # IBM hardware primitives (used once per N)
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+
+    rows: List[Dict] = []
+    total_jobs = len(sizes) * trials
+    job_idx = 0
+
+    for N in sizes:
+        # ---------- Single hardware Trotter run for this N ----------
+        hw_metrics = hardware_hsim_single(
+            N=N,
+            T=T,
+            r_steps=r_steps,
+            order=order,
+            J=J,
+            h=h,
+            periodic=periodic,
+            backend=backend,
+            sampler=sampler,
+            pass_manager=pm,
+            shots=shots,
+            hardware_trotter_steps=hardware_trotter_steps,
+        )
+
+        # ---------- Ideal trials for this N ----------
+        for i in range(trials):
+            job_idx += 1
+            seed = 1000 + 53*int(N) + i
+            print(f"\n[qhsim-ibm-light] Job {job_idx}/{total_jobs}: N={N}, trial={i+1}/{trials}, seed={seed}")
+            res_ideal = run_single_ideal(
+                N=N,
+                steps=steps,
+                seed=seed,
+                T=T,
+                r_steps=r_steps,
+                order=order,
+                J=J,
+                h=h,
+                periodic=periodic,
+                acc_tol=acc_tol,
+                ref_mult=ref_mult,
+            )
+
+            row = dict(res_ideal)
+            row["backend_name"] = backend.name
+            row["shots"] = int(shots)
+
+            if i == 0:
+                # First trial per N: add hardware runtime to total for carbon & performance
+                row.update(hw_metrics)
+                row["runtime_s"] = float(res_ideal["host_runtime_s"] + hw_metrics["hardware_runtime_s"])
+            else:
+                # Subsequent trials: no hardware call
+                row["hardware_runtime_s"] = 0.0
+                row["hardware_circuit_depth"] = hw_metrics.get("hardware_circuit_depth", 0)
+                row["hardware_qubits"] = hw_metrics.get("hardware_qubits", int(N))
+                row["hardware_r_hw"] = hw_metrics.get("hardware_r_hw", 0)
+                row["hardware_shots"] = hw_metrics.get("hardware_shots", int(shots))
+                row["hardware_counts_total"] = 0
+                row["runtime_s"] = float(res_ideal["host_runtime_s"])
+
+            rows.append(row)
+            print(f"    -> fidelity={row['accuracy_mean']:.3f}, "
+                  f"rmse={row['rmse_mean']:.4e}, "
+                  f"runtime={row['runtime_s']:.4f}s, "
+                  f"success={int(row['success'])}")
+
+    df = pd.DataFrame(rows)
+    print("\n[qhsim-ibm-light] Finished all runs. Example rows:")
+    print(df.head())
+
+    # ---------- Performance Excel ----------
+    perf_xlsx = perf_dir / "performance_qhsim_ibm_hardware_light.xlsx"
+    perf_agg = df.groupby("N").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        mean_host_runtime_s=("host_runtime_s","mean"),
+        mean_hardware_runtime_s=("hardware_runtime_s","mean"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        mean_fidelity=("accuracy_mean","mean"),
+        mean_rmse=("rmse_mean","mean"),
+        mean_exp_ops=("exp_ops_total","mean"),
+        success_rate=("success","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(df, str(perf_dir))
+    print(f"[qhsim-ibm-light] Performance Excel written to: {perf_xlsx}")
+
+    # ---------- Scalability Excel ----------
+    scal_xlsx = scal_dir / "scalability_qhsim_ibm_hardware_light.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_xlsx, engine="openpyxl") as w:
+            df[["N","runtime_s","host_runtime_s","hardware_runtime_s","peak_mem_mb","exp_ops_total"]].to_excel(
+                w, index=False, sheet_name="raw"
+            )
+            df.groupby("N").mean(numeric_only=True).reset_index().to_excel(
+                w, index=False, sheet_name="aggregated"
+            )
+
+    plot_scalability(df, str(scal_dir))
+    print(f"[qhsim-ibm-light] Scalability Excel written to: {scal_xlsx}")
+
+    # ---------- Reliability Excel ----------
+    rel_xlsx = rel_dir / "reliability_qhsim_ibm_hardware_light.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_xlsx, engine="openpyxl") as w:
+            df[["N","seed","accuracy_mean","rmse_mean","success"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg = df.groupby("N").agg(
+                mean_fidelity=("accuracy_mean","mean"),
+                std_fidelity=("accuracy_mean","std"),
+                success_rate=("success","mean"),
+            ).reset_index()
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability(df, str(rel_dir))
+    print(f"[qhsim-ibm-light] Reliability Excel written to: {rel_xlsx}")
+
+    # ---------- Carbon footprints ----------
+    excel_path = resolve_excel_path_notebook(excel_filename)
+    carbon_df = None
+    summary_df = None
+    try:
+        intensity_df = load_carbon_excel(excel_path, year_select=year_select)
+        print(f"[carbon] Loaded CO2 intensity table from: {excel_path}")
+        carbon_df, summary_df = compute_carbon(
+            df, intensity_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_xlsx = carb_dir / "carbon_qhsim_ibm_hardware_light.xlsx"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_xlsx, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input")
+
+        plot_carbon(carbon_df, str(carb_dir))
+        print(f"[carbon] Carbon Excel written to: {carb_xlsx}")
+    except Exception as e:
+        print(f"[carbon] ERROR reading Excel '{excel_path}': {e}")
+        print("[carbon] Skipping carbon benchmark. Re-run once the CO2 file is available.")
+
+    print("\n[qhsim-ibm-light] All benchmarks complete.")
+    return {
+        "perf_df": df,
+        "perf_dir": str(perf_dir),
+        "scal_dir": str(scal_dir),
+        "rel_dir": str(rel_dir),
+        "carbon_dir": str(carb_dir),
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }

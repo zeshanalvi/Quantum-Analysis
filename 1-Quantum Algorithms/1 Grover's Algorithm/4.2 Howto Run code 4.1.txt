@@ -1,0 +1,31 @@
+import os
+
+# Example IBM hardware Grover run:
+#   n_min=2, n_max=5  -> N = 4,8,16,32
+#   trials=5, single marked state (|0...0>), acc_tol=0.9
+#   CO2 Excel from Desktop, 65 W, PUE 1.2
+
+outdir_qgrover_ibm = os.path.join(
+    os.environ.get("USERPROFILE", ""),
+    "Desktop",
+    "QuantumGroverIBMOutputs",
+)
+
+results_qgrover_ibm = run_quantum_grover_ibm_hardware_notebook(
+    n_min=2,
+    n_max=5,
+    trials=5,
+    marked_count=1,   # hardware oracle only supports 1 solution (|0...0>)
+    acc_tol=0.9,
+    shots=1024,       # hardware shots per run
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir=outdir_qgrover_ibm,
+    seed=7,
+    backend_name="ibm_torino",  # change if you use a different IBM backend
+    max_iterations_hw=8,        # can cap Grover iterations to keep circuits light
+)
+
+results_qgrover_ibm["perf_df"].head()

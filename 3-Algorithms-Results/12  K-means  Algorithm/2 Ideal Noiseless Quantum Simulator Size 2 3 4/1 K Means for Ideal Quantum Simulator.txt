@@ -1,0 +1,301 @@
+# quantum_kmeans_5point_notebook.py
+#
+# Quantum-inspired K-Means on 5-point 2D example — ideal noiseless simulator.
+#
+# Same 4 benchmark folders:
+#   Performance/
+#   Scalability/
+#   Reliability/
+#   Carbon footprints/<outdir>/
+#
+# Entry:
+#   results_qkmeans = run_qkmeans_5point_notebook(...)
+#   results_qkmeans["perf_df"].head()
+
+import os, time, warnings, pathlib, tracemalloc, math, itertools
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from typing import List, Tuple
+
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import Statevector
+
+# ===== Fixed 5-point dataset =====
+DATA = np.array([
+    [1.0, 1.0],
+    [2.0, 1.0],
+    [4.0, 3.0],
+    [5.0, 4.0],
+    [6.0, 5.0],
+], dtype=np.float64)
+
+
+# ===== Quantum feature map + fidelity (ideal simulator) =====
+
+def build_feature_map(x: np.ndarray) -> QuantumCircuit:
+    """Small 2D feature map |ψ(x)> with RZ–RX–RZZ encoding."""
+    x = np.asarray(x, dtype=float)
+    q = x.shape[0]
+    qc = QuantumCircuit(q)
+    for i in range(q):
+        qc.h(i)
+    for i in range(q):
+        theta = math.pi * x[i]
+        qc.rz(theta, i)
+        qc.rx(theta, i)
+    # entangle
+    for i in range(q):
+        for j in range(i+1, q):
+            qc.rzz(math.pi * x[i] * x[j], i, j)
+    return qc
+
+def quantum_fidelity(x: np.ndarray, z: np.ndarray) -> float:
+    """Compute |⟨ψ(x)|ψ(z)⟩|² using noiseless simulator (statevector overlap)."""
+    qx = build_feature_map(x)
+    qz = build_feature_map(z)
+    sv_x = Statevector.from_instruction(qx)
+    sv_z = Statevector.from_instruction(qz)
+    overlap = sv_x.data.conj().dot(sv_z.data)
+    return float(np.abs(overlap)**2)
+
+def quantum_distance(x: np.ndarray, z: np.ndarray) -> float:
+    """Define quantum 'distance' as sqrt(1 - fidelity)."""
+    return math.sqrt(max(0.0, 1.0 - quantum_fidelity(x, z)))
+
+
+# ===== Quantum K-Means (noiseless) =====
+
+def pairwise_qdist(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Quantum distance matrix between two sets of points."""
+    n1, n2 = A.shape[0], B.shape[0]
+    D = np.zeros((n1, n2))
+    for i in range(n1):
+        for j in range(n2):
+            D[i, j] = quantum_distance(A[i], B[j])
+    return D
+
+def quantum_kmeans_labels(X: np.ndarray, K: int, max_iter=20, seed=0):
+    """Quantum-inspired K-Means with quantum distances (ideal simulator)."""
+    rng = np.random.default_rng(seed)
+    n = X.shape[0]
+    K_eff = max(1, min(K, n))
+    idx0 = rng.choice(n, size=K_eff, replace=False)
+    centers = X[idx0].copy()
+    labels = np.full(n, -1, dtype=np.int32)
+
+    for _ in range(max_iter):
+        d = pairwise_qdist(X, centers)
+        new_labels = np.argmin(d, axis=1)
+        if np.array_equal(new_labels, labels):
+            labels = new_labels
+            break
+        labels = new_labels
+        for k in range(K_eff):
+            members = (labels == k)
+            if np.any(members):
+                centers[k] = X[members].mean(axis=0)
+    return labels, K_eff
+
+def compute_inertia_q(X, labels, K_eff):
+    """Sum of squared quantum distances to cluster centroids."""
+    total = 0.0
+    for k in range(K_eff):
+        members = X[labels == k]
+        if len(members) == 0:
+            continue
+        center = members.mean(axis=0)
+        for x in members:
+            total += quantum_distance(x, center)**2
+    return total
+
+def clustering_accuracy_vs_reference(labels, ref_labels, K_eff):
+    """Accuracy vs reference, up to permutation."""
+    labels = np.asarray(labels)
+    ref_labels = np.asarray(ref_labels)
+    n = labels.shape[0]
+    if n == 0:
+        return 0.0
+    best = 0.0
+    for perm in itertools.permutations(range(K_eff)):
+        perm = np.array(perm, dtype=np.int32)
+        mapped = perm[labels]
+        acc = float(np.mean(mapped == ref_labels))
+        if acc > best:
+            best = acc
+    return best
+
+
+# ===== Carbon & plotting utilities (same as classical version) =====
+
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+    return str(p)
+
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+    df = pd.read_excel(path)
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k,v in cols.items() if "country" in k or "nation" in k or k=="location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found.")
+    year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k,v in cols.items()
+                      if "intensity" in k or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k or "gco2" in k), None)
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country","Year","Intensity"] if len(keep)==3 else ["Country","Intensity"]
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country",as_index=False).tail(1)
+    med = float(df["Intensity"].dropna().median())
+    if med>50: df["Intensity"]/=1000.0
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+def compute_carbon(perf_df, intensity_df, power_watts, pue):
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s":[total_runtime_s],
+        "power_watts":[power_watts],
+        "PUE":[pue],
+        "kWh_total":[kWh_total],
+        "median_intensity_kg_per_kWh":[float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries":[float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e",ascending=False), summary
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def plot_perf_scal_rel(df, perf_dir, scal_dir, rel_dir):
+    # Performance
+    g=df.groupby("K_eff")["runtime_s"].mean().reset_index()
+    plt.figure(); plt.plot(g["K_eff"],g["runtime_s"],"o-")
+    plt.title("Quantum K-Means (ideal) — Runtime vs K"); plt.xlabel("K"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True,alpha=0.3)
+    plt.savefig(perf_dir/"perf_runtime_vs_K_qkmeans.png",**plt_kwargs); plt.close()
+    g2=df.groupby("K_eff")["accuracy"].mean().reset_index()
+    plt.figure(); plt.plot(g2["K_eff"],g2["accuracy"],"s-")
+    plt.title("Quantum K-Means (ideal) — Accuracy vs K"); plt.xlabel("K"); plt.ylabel("Accuracy")
+    plt.grid(True,alpha=0.3)
+    plt.savefig(perf_dir/"perf_accuracy_vs_K_qkmeans.png",**plt_kwargs); plt.close()
+
+    # Scalability
+    plt.figure(); plt.loglog(g["K_eff"],g["runtime_s"],"o")
+    plt.title("Scalability (log–log) — Quantum K-Means (ideal)")
+    plt.xlabel("K"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True,which="both",alpha=0.3)
+    plt.savefig(scal_dir/"scal_runtime_vs_K_qkmeans.png",**plt_kwargs); plt.close()
+
+    # Reliability
+    g3=df.groupby("K_eff")["success"].mean().reset_index()
+    plt.figure(); plt.plot(g3["K_eff"],g3["success"],"o-")
+    plt.ylim(-0.05,1.05)
+    plt.title("Reliability — Quantum K-Means (ideal)")
+    plt.xlabel("K"); plt.ylabel("Success rate")
+    plt.grid(True,alpha=0.3)
+    plt.savefig(rel_dir/"rel_success_vs_K_qkmeans.png",**plt_kwargs); plt.close()
+
+
+# ===== Single run =====
+
+def run_single_qkmeans(K,max_iter,acc_tol,seed):
+    """Single Quantum K-Means (ideal simulator) experiment."""
+    K_eff=int(max(1,min(K,DATA.shape[0])))
+    ref_labels,_=quantum_kmeans_labels(DATA,K_eff,max_iter=max_iter,seed=0)
+
+    tracemalloc.start(); t0=time.perf_counter()
+    labels,K_run=quantum_kmeans_labels(DATA,K_eff,max_iter=max_iter,seed=seed)
+    inertia=compute_inertia_q(DATA,labels,K_eff)
+    acc=clustering_accuracy_vs_reference(labels,ref_labels,K_eff)
+    runtime=time.perf_counter()-t0; _,peak=tracemalloc.get_traced_memory(); tracemalloc.stop()
+    return {
+        "K":K,"K_eff":K_eff,"seed":seed,"runtime_s":runtime,
+        "peak_mem_mb":peak/(1024**2),"accuracy":acc,
+        "inertia":inertia,"success":bool(acc>=acc_tol)
+    }
+
+
+# ===== Notebook entry =====
+
+def run_qkmeans_5point_notebook(
+    sizes=(2,3,4),
+    steps=20,
+    trials=10,
+    acc_tol=0.5,
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country",
+):
+    print("[qkmeans-5pt] Quantum K-Means (ideal simulator)")
+    print("sizes:",sizes,"steps:",steps,"trials:",trials)
+    cwd=pathlib.Path.cwd()
+    perf_dir=cwd/"Performance"; scal_dir=cwd/"Scalability"
+    rel_dir=cwd/"Reliability"; carb_root=cwd/"Carbon footprints"; carb_dir=carb_root/outdir
+    for d in [perf_dir,scal_dir,rel_dir,carb_dir]: d.mkdir(parents=True,exist_ok=True)
+
+    rows=[]; total=len(sizes)*trials; idx=0
+    for K in sizes:
+        for t in range(trials):
+            idx+=1; seed=1000+17*K+t
+            print(f"[qkmeans-5pt] Run {idx}/{total} K={K} trial={t+1}")
+            res=run_single_qkmeans(K,steps,acc_tol,seed)
+            rows.append(res)
+            print(f"  -> acc={res['accuracy']:.3f}, runtime={res['runtime_s']:.4f}s, success={int(res['success'])}")
+    df=pd.DataFrame(rows)
+
+    # Save to Excel
+    perf_xlsx=perf_dir/"performance_results.xlsx"
+    scal_xlsx=scal_dir/"scalability_results.xlsx"
+    rel_xlsx=rel_dir/"reliability_results.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx,engine="openpyxl") as w:
+            df.to_excel(w,index=False,sheet_name="raw_runs")
+            df.groupby("K_eff").mean(numeric_only=True).reset_index().to_excel(w,index=False,sheet_name="aggregated")
+    df.to_excel(scal_xlsx,index=False); df.to_excel(rel_xlsx,index=False)
+    plot_perf_scal_rel(df,perf_dir,scal_dir,rel_dir)
+
+    # Carbon
+    excel_path=resolve_excel_path_notebook(excel_filename)
+    carbon_df=None; summary_df=None
+    try:
+        intensity_df=load_carbon_excel(excel_path,year_select)
+        carbon_df,summary_df=compute_carbon(df,intensity_df,device_power_watts,pue)
+        carb_xlsx=carb_dir/"carbon_results.xlsx"
+        with pd.ExcelWriter(carb_xlsx,engine="openpyxl") as w:
+            carbon_df.to_excel(w,index=False,sheet_name="per_country")
+            summary_df.to_excel(w,index=False,sheet_name="summary")
+            intensity_df.to_excel(w,index=False,sheet_name="intensity_input")
+        print(f"[carbon] Saved to {carb_xlsx}")
+    except Exception as e:
+        print("[carbon] ERROR loading Excel:",e)
+    return {
+        "perf_df":df,
+        "perf_dir":str(perf_dir),
+        "scal_dir":str(scal_dir),
+        "rel_dir":str(rel_dir),
+        "carbon_dir":str(carb_dir),
+        "carbon_df":carbon_df,
+        "carbon_summary":summary_df,
+    }

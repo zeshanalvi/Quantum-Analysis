@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# classical_kmeans_5point_notebook.py
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+# ------------********------------ Imports
+import os, time, warnings, pathlib, tracemalloc, math, itertools
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# ------------********------------ Fixed dataset: 5 points
+#DATA defines a small fixed 2D dataset of five sample points used as input features for demonstration or benchmarking.
+#Each row represents one point in ℝ², labeled sequentially (P1–P5) for clarity in experiments or visualizations.
+
+DATA = np.array([
+    [1.0, 1.0],  # P1
+    [2.0, 1.0],  # P2
+    [4.0, 3.0],  # P3
+    [5.0, 4.0],  # P4
+    [6.0, 5.0],  # P5
+], dtype=np.float64)
+
+
+# ------------********------------ Tiny K-Means (Lloyd) 
+#def pairwise_dists computes the full matrix of Euclidean distances between rows of A and rows of B.
+#It uses the squared-norm identity ‖a−b‖² = ‖a‖² + ‖b‖² − 2a·b for vectorized efficiency.
+#A max-with-zero guard ensures numerical stability before taking the square root.
+
+def pairwise_dists(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    A2 = np.sum(A*A, axis=1, keepdims=True)
+    B2 = np.sum(B*B, axis=1, keepdims=True).T
+    return np.sqrt(np.maximum(A2 + B2 - 2.0*A@B.T, 0.0))
+
+
+
+#def kmeans_labels implements a simple Lloyd-style K-Means clustering routine for small datasets.
+#It initializes random centers, iteratively assigns points by nearest-center distance, 
+#  and updates centroids until convergence or max_iter.
+#Empty clusters are handled by reseeding the center to the farthest data point,
+#   and the function returns final labels and effective K.
+
+def kmeans_labels(X: np.ndarray, K: int, max_iter: int = 50, seed: int = 0):
+    """Simple Lloyd K-Means for tiny datasets; returns (labels, K_eff)."""
+    rng = np.random.default_rng(seed)
+    n = X.shape[0]
+    K_eff = max(1, min(K, n))
+    idx0 = rng.choice(n, size=K_eff, replace=False)
+    centers = X[idx0].copy()
+    labels = np.full(n, -1, dtype=np.int32)
+
+    for _ in range(max_iter):
+        d = pairwise_dists(X, centers)
+        new_labels = np.argmin(d, axis=1)
+        if np.array_equal(new_labels, labels):
+            labels = new_labels
+            break
+        labels = new_labels
+        for k in range(K_eff):
+            members = (labels == k)
+            if np.any(members):
+                centers[k] = X[members].mean(axis=0)
+            else:
+                # re-seed to farthest point
+                dmin = d[np.arange(n), labels]
+                far = np.argmax(dmin)
+                centers[k] = X[far]
+    return labels, K_eff
+
+
+#def compute_inertia calculates the K-Means inertia as the sum of squared distances from points to their assigned cluster centroids.
+#It iterates over clusters, recomputes each centroid from assigned members, 
+#  and accumulates within-cluster variance.
+#Empty clusters are safely skipped, and the total inertia is returned as a scalar float.
+
+def compute_inertia(X: np.ndarray, labels: np.ndarray, K_eff: int) -> float:
+   
+    total = 0.0
+    for k in range(K_eff):
+        members = X[labels == k]
+        if len(members) == 0:
+            continue
+        center = members.mean(axis=0)
+        diff = members - center
+        total += float(np.sum(diff*diff))
+    return total
+
+#def clustering_accuracy_vs_reference function computes clustering accuracy by 
+#   finding the best permutation alignment between predicted and reference labels.
+#It exhaustively checks all label permutations for K_eff clusters to account for label symmetry in clustering.
+#The function returns the maximum fraction of correctly matched labels as the clustering accuracy.
+
+def clustering_accuracy_vs_reference(labels, ref_labels, K_eff: int) -> float:
+  
+    labels = np.asarray(labels, dtype=np.int32)
+    ref_labels = np.asarray(ref_labels, dtype=np.int32)
+    n = labels.shape[0]
+    if n == 0:
+        return 0.0
+    best = 0.0
+    for perm in itertools.permutations(range(K_eff)):
+        perm = np.array(perm, dtype=np.int32)
+        mapped = perm[labels]
+        acc = float(np.mean(mapped == ref_labels))
+        if acc > best:
+            best = acc
+    return best
+
+
+# ------------********------------ Carbon helpers (Excel, latest year per country)
+
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    
+    #    Resolve Excel path:
+    #  - If absolute and exists, use directly.
+    #  - Else, try Desktop/<excel_arg>.
+    #  - Else, treat as relative to CWD.
+    
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+
+    return str(p)
+
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+    df = pd.read_excel(path)
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k,v in cols.items()
+                    if "country" in k or "nation" in k or k=="location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found in CO2 file.")
+
+    year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k,v in cols.items()
+                      if "intensity" in k
+                      or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k
+                      or "gco2" in k), None)
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column detected.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country", "Year", "Intensity"] if len(keep)==3 else ["Country", "Intensity"]
+
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country", as_index=False).tail(1)
+
+    # Heuristic: if median > 50, assume gCO2/kWh and convert to kgCO2/kWh
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0
+
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+def compute_carbon(perf_df: pd.DataFrame,
+                   intensity_df: pd.DataFrame,
+                   power_watts: float,
+                   pue: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+   
+    # Carbon from PERFORMANCE runtimes only (sum over all runs).
+
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "power_watts": [power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+
+# ------------********------------ Plotting helpers
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+# ------------********------------
+def plot_performance(df: pd.DataFrame, outdir: str):
+    g = df.groupby("K_eff")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["K_eff"], g["runtime_s"], marker="o")
+    plt.title("Performance: Runtime vs K (K-Means)")
+    plt.xlabel("K"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_runtime_vs_K_kmeans.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("K_eff")["accuracy"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["K_eff"], g2["accuracy"], marker="s")
+    plt.title("Performance: Mean clustering accuracy vs K (K-Means)")
+    plt.xlabel("K"); plt.ylabel("Accuracy vs reference")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_accuracy_vs_K_kmeans.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_scalability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("K_eff")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.loglog(g["K_eff"], g["runtime_s"], "o")
+    plt.title("Scalability: Runtime (log–log) vs K (K-Means)")
+    plt.xlabel("K"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_loglog_runtime_vs_K_kmeans.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("K_eff")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["K_eff"], g2["peak_mem_mb"], marker="^")
+    plt.title("Scalability: Peak memory vs K (K-Means)")
+    plt.xlabel("K"); plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_peakmem_vs_K_kmeans.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_reliability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("K_eff")["success"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["K_eff"], g["success"], marker="o")
+    plt.ylim(-0.05, 1.05)
+    plt.title("Reliability: Success rate vs K (K-Means)")
+    plt.xlabel("K"); plt.ylabel("Success rate")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_success_vs_K_kmeans.png"), **plt_kwargs)
+    plt.close()
+
+    data = [df[df["K_eff"]==k]["accuracy"].values
+            for k in sorted(df["K_eff"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["K_eff"].unique()))
+    plt.title("Reliability: Accuracy distribution by K (K-Means)")
+    plt.xlabel("K"); plt.ylabel("Accuracy vs reference")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_accuracy_boxplot_kmeans.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_carbon(df: pd.DataFrame, outdir: str):
+    top = df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8,5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Carbon: Top 15 countries (kgCO2e) — K-Means 5-point")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "carbon_top15_kmeans.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(df["kgCO2e"], bins=30)
+    plt.title("Carbon: Emission distribution — K-Means 5-point")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "carbon_distribution_kmeans.png"), **plt_kwargs)
+    plt.close()
+
+
+# ------------********------------ Single K-Means experiment 
+
+def run_single_kmeans(K: int, max_iter: int, acc_tol: float, seed: int) -> dict:
+    
+    #    One K-Means run for given K and seed:
+    #  - Reference clustering: K-Means with seed=0 (acts as "ground truth").
+    #  - This run: K-Means with given seed.
+    #  - Metrics: inertia, accuracy vs reference (up to permutation), runtime, memory.
+    
+    K_eff = int(max(1, min(K, DATA.shape[0])))
+
+    # Reference labels
+    ref_labels, ref_K_eff = kmeans_labels(DATA, K_eff, max_iter=max_iter, seed=0)
+    K_eff = min(K_eff, ref_K_eff)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    labels, K_run = kmeans_labels(DATA, K_eff, max_iter=max_iter, seed=seed)
+    K_eff = min(K_eff, K_run)
+
+    inertia = compute_inertia(DATA, labels, K_eff)
+    acc = clustering_accuracy_vs_reference(labels, ref_labels, K_eff)
+    success = bool(acc >= acc_tol)
+
+    runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    n_params = K_eff * DATA.shape[1]   # centroid coordinates
+    n_samples = DATA.shape[0]
+
+    return {
+        "K": int(K),
+        "K_eff": int(K_eff),
+        "seed": int(seed),
+        "runtime_s": float(runtime),
+        "peak_mem_mb": float(peak / (1024**2)),
+        "accuracy": float(acc),
+        "final_loss": float(inertia),
+        "success": success,
+        "n_params": int(n_params),
+        "n_samples": int(n_samples),
+    }
+
+
+# ------------********------------ Notebook entry point 
+
+def run_kmeans_5point_notebook(
+    sizes=(2, 3, 4),
+    steps: int = 50,              # max_iter for K-Means
+    trials: int = 20,
+    acc_tol: float = 0.5,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = "carbon_by_country",
+):
+  
+     #  Runs classical K-Means on the 5-point dataset for the given Ks (sizes),
+     #  Returns a dict with:
+     #  - "perf_df"        : raw runs DataFrame
+     #  - "perf_dir"       : str path
+     #  - "scal_dir"       : str path
+     #  - "rel_dir"        : str path
+     #  - "carbon_dir"     : str path
+     #  - "carbon_df"      : per-country carbon (or None if Excel missing)
+     #  - "carbon_summary" : summary DataFrame (or None)
+  
+    sizes = list(sizes)
+    print("[kmeans-5pt] Classical K-Means benchmark (notebook mode)")
+    print("  K (sizes):", sizes)
+    print(f"  steps/max_iter={steps}, trials={trials}, acc_tol={acc_tol}")
+    print(f"  excel_filename={excel_filename}")
+    print(f"  device_power_watts={device_power_watts}, PUE={pue}, year_select={year_select}, outdir='{outdir}'")
+
+    # Output folders (current working directory, same as quantum_svm_iris_benchmarks.py)
+    cwd = pathlib.Path.cwd()
+    perf_dir = cwd / "Performance"
+    scal_dir = cwd / "Scalability"
+    rel_dir  = cwd / "Reliability"
+    carb_root = cwd / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_root, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print("  Output folders:")
+    print(f"    Performance -> {perf_dir}")
+    print(f"    Scalability -> {scal_dir}")
+    print(f"    Reliability -> {rel_dir}")
+    print(f"    Carbon      -> {carb_dir}")
+
+    rows: List[dict] = []
+    total_jobs = len(sizes) * trials
+    job_idx = 0
+
+    for K in sizes:
+        for t in range(trials):
+            job_idx += 1
+            seed = 1000 + 17*int(K) + t
+            print(f"\n[kmeans-5pt] Job {job_idx}/{total_jobs}: "
+                  f"K={K}, trial={t+1}/{trials}, seed={seed}")
+            res = run_single_kmeans(int(K), max_iter=steps, acc_tol=acc_tol, seed=seed)
+            rows.append(res)
+            print(f"    -> acc={res['accuracy']:.3f}, inertia={res['final_loss']:.4f}, "
+                  f"runtime={res['runtime_s']:.6f}s, success={int(res['success'])}")
+
+    df = pd.DataFrame(rows)
+    print("\n[kmeans-5pt] Finished all runs. Example rows:")
+    print(df.head())
+
+# ------------********------------
+    # ----- Performance -----
+    perf_xlsx = perf_dir / "performance_results.xlsx"
+    perf_agg = df.groupby("K_eff").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        mean_accuracy=("accuracy","mean"),
+        mean_loss=("final_loss","mean"),
+        success_rate=("success","mean"),
+        mean_params=("n_params","mean"),
+        mean_samples=("n_samples","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(df, str(perf_dir))
+    print(f"[kmeans-5pt] Performance Excel written to: {perf_xlsx}")
+
+# ------------********------------
+    # ----- Scalability -----
+    scal_xlsx = scal_dir / "scalability_results.xlsx"
+    scal_agg = df.groupby("K_eff").mean(numeric_only=True).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_xlsx, engine="openpyxl") as w:
+            df[["K_eff","runtime_s","peak_mem_mb","n_params"]].to_excel(
+                w, index=False, sheet_name="raw"
+            )
+            scal_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_scalability(df, str(scal_dir))
+    print(f"[kmeans-5pt] Scalability Excel written to: {scal_xlsx}")
+
+# ------------********------------
+    # ----- Reliability -----
+    rel_xlsx = rel_dir / "reliability_results.xlsx"
+    rel_agg = df.groupby("K_eff").agg(
+        success_rate=("success","mean"),
+        mean_acc=("accuracy","mean"),
+        std_acc=("accuracy","std"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_xlsx, engine="openpyxl") as w:
+            df[["K_eff","seed","accuracy","success"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability(df, str(rel_dir))
+    print(f"[kmeans-5pt] Reliability Excel written to: {rel_xlsx}")
+
+# ------------********------------
+    # ----- Carbon (PERFORMANCE runtime only) -----
+    excel_path = resolve_excel_path_notebook(excel_filename)
+    carbon_df = None
+    summary_df = None
+
+    try:
+        intensity_df = load_carbon_excel(excel_path, year_select=year_select)
+        print(f"[carbon] Loaded CO2 intensity table from: {excel_path}")
+        carbon_df, summary_df = compute_carbon(
+            df, intensity_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_xlsx = carb_dir / "carbon_results.xlsx"
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_xlsx, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input")
+
+        plot_carbon(carbon_df, str(carb_dir))
+        print(f"[carbon] Carbon Excel written to: {carb_xlsx}")
+    except Exception as e:
+        print(f"[carbon] ERROR reading Excel '{excel_path}': {e}")
+        print("[carbon] Skipping carbon benchmark. Re-run once the file is available.")
+
+    print("\n[kmeans-5pt] All benchmarks complete.")
+    return {
+        "perf_df": df,
+        "perf_dir": str(perf_dir),
+        "scal_dir": str(scal_dir),
+        "rel_dir": str(rel_dir),
+        "carbon_dir": str(carb_dir),
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }

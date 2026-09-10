@@ -1,0 +1,839 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# Quantum SVM (QSVM) for Iris with "light" IBM hardware Real Q  uantum Hwre
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+# qsvm_iris_ibm_hardware_notebook.py  (light resource version)
+# Quantum SVM (QSVM) for Iris with *light* IBM hardware usage:
+#   - Training & inference: classical simulation of the same quantum kernel as quantum_svm_iris_benchmarks.py.
+#   - Hardware: tiny kernel probe per run (≤4 compute–uncompute circuits via SamplerV2).
+#   - Benchmarks: Performance, Scalability, Reliability, Carbon (Desktop folders).
+#
+# Outputs on Desktop:
+#   Desktop/Performance/performance_qsvm_iris_ibm_hardware.xlsx + plots
+#   Desktop/Scalability/scalability_qsvm_iris_ibm_hardware.xlsx + plots
+#   Desktop/Reliability/reliability_qsvm_iris_ibm_hardware.xlsx + plots
+#   Desktop/Carbon footprints/<outdir>/carbon_qsvm_iris_ibm_hardware.xlsx + plots
+#
+# Notebook entry:
+#   results_qsvm_ibm = run_qsvm_iris_ibm_hardware_notebook(...)
+#   results_qsvm_ibm["perf_df"].head()
+
+
+
+# ------------********------------ Imports
+#These imports provide core utilities for filesystem handling, timing, warnings, and memory profiling, 
+#       along with NumPy and pandas for data processing.
+#Matplotlib is configured with a non-interactive backend to generate and save plots in headless environments.
+#Qiskit Runtime components enable execution of quantum circuits on IBM backends,
+#       while scikit-learn modules support classical preprocessing, SVM training, and evaluation.
+
+import os, time, warnings, pathlib, tracemalloc, math
+from typing import List, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+from sklearn import datasets
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, hinge_loss
+
+# ------------********------------
+# ===================== Classical simulation of QSVM quantum kernel (from noiseless script)
+# ------------********------------
+
+I2 = np.eye(2, dtype=np.complex128)
+H = (1/np.sqrt(2.0)) * np.array([[1,1],[1,-1]], dtype=np.complex128)
+
+def Rz(theta: float):
+    c = math.cos(theta/2.0); s = math.sin(theta/2.0)
+    return np.array([[c-1j*s, 0],[0, c+1j*s]], dtype=np.complex128)
+
+def Rx(theta: float):
+    c = math.cos(theta/2.0); s = math.sin(theta/2.0)
+    return np.array([[c, -1j*s],[-1j*s, c]], dtype=np.complex128)
+
+def apply_1q(state: np.ndarray, U: np.ndarray, q: int, nqubits: int):
+    # Apply 1-qubit U to qubit index q (0=leftmost) on |ψ⟩ (2^n vector).
+    ops = [I2]*nqubits
+    ops[q] = U
+    bigU = ops[0]
+    for k in range(1, nqubits):
+        bigU = np.kron(bigU, ops[k])
+    return bigU @ state
+
+def apply_ZZ_phase(state: np.ndarray, i: int, j: int, theta: float, nqubits: int):
+
+    # Apply exp(-i θ/2 Z_i Z_j) by phasing amplitudes in place.
+    dim = state.shape[0]
+    pos_i = (nqubits - 1 - i)
+    pos_j = (nqubits - 1 - j)
+    phase_pos = np.exp(-1j * theta/2.0)
+    phase_neg = np.exp(+1j * theta/2.0)
+    for idx in range(dim):
+        bi = (idx >> pos_i) & 1
+        bj = (idx >> pos_j) & 1
+        zi = +1 if bi == 0 else -1
+        zj = +1 if bj == 0 else -1
+        state[idx] *= (phase_pos if (zi*zj) == +1 else phase_neg)
+
+def feature_state_from_x(x: np.ndarray) -> np.ndarray:
+   # """
+    #Feature map |ψ(x)⟩, q=len(x):
+    #  |0…0> → H on all qubits →
+     # For each i: RZ(π x_i), RX(π x_i) →
+    ##  For i<j: ZZ(π x_i x_j).
+    # """
+    q = int(x.shape[0])
+    dim = 1 << q
+    state = np.zeros((dim,), dtype=np.complex128); state[0] = 1.0
+    for i in range(q):
+        state = apply_1q(state, H, i, q)
+    for i in range(q):
+        state = apply_1q(state, Rz(math.pi*float(x[i])), i, q)
+        state = apply_1q(state, Rx(math.pi*float(x[i])), i, q)
+    for i in range(q):
+        for j in range(i+1, q):
+            theta = math.pi * float(x[i]) * float(x[j])
+            apply_ZZ_phase(state, i, j, theta, q)
+    nrm = np.linalg.norm(state)
+    return state if nrm == 0 else state / nrm
+
+def fidelity_kernel_matrix(XA: np.ndarray, XB: np.ndarray) -> np.ndarray:
+
+    #K[i,j] = |⟨ψ(xA_i)|ψ(xB_j)⟩|^2.
+    states_A = [feature_state_from_x(XA[i]) for i in range(XA.shape[0])]
+    states_B = [feature_state_from_x(XB[i]) for i in range(XB.shape[0])]
+    K = np.empty((XA.shape[0], XB.shape[0]), dtype=np.float64)
+    for i, sa in enumerate(states_A):
+        overlaps = np.array([np.vdot(sa, sb) for sb in states_B])
+        K[i, :] = (np.abs(overlaps)**2).real
+    return K
+
+
+# ------------********------------
+# ===================== Version-proof hinge loss
+# ------------********------------
+
+def safe_hinge_loss(y_true, df_scores, classes):
+    #
+   # 1) Try sklearn.metrics.hinge_loss(y_true, decision_function, labels=classes).
+   # 2) Fallback: manual OvR hinge loss.
+   # 
+    y_true = np.asarray(y_true)
+    df_scores = np.asarray(df_scores)
+    try:
+        return float(hinge_loss(y_true, df_scores, labels=classes))
+    except TypeError:
+        pass
+    if df_scores.ndim == 1:
+        df_scores = df_scores.reshape(-1,1)
+        df_scores = np.hstack([-df_scores, df_scores])
+        classes = np.array(classes[:2])
+    Y_bin = label_binarize(y_true, classes=classes)
+    Y = 2.0*Y_bin - 1.0
+    loss = np.maximum(0.0, 1.0 - Y*df_scores)
+    return float(np.mean(loss))
+
+# ------------********------------
+# ===================== IBM hardware helpers: lightweight kernel probe
+# ------------********------------
+
+def get_ibm_sampler(backend_name: str, shots: int):
+    
+    #Create a SamplerV2 primitive on a real IBM backend.
+    #Uses generate_preset_pass_manager for ISA-compliant circuits.
+    
+    print("[ibm] Initializing QiskitRuntimeService (using saved account)...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = SamplerV2(mode=backend)
+    return backend, sampler, pm
+
+def build_feature_map_circuit(x: np.ndarray) -> QuantumCircuit:
+   
+   # Qiskit implementation of the same feature map.
+   # Input x is assumed in [0,1]^q.
+   
+    x = np.asarray(x, dtype=float)
+    q = int(x.shape[0])
+    qc = QuantumCircuit(q, q)
+    # H layer
+    for i in range(q):
+        qc.h(i)
+    # RX/RZ
+    for i in range(q):
+        theta = math.pi * float(x[i])
+        qc.rz(theta, i)
+        qc.rx(theta, i)
+    # ZZ
+    pairs = []
+    for i in range(q):
+        for j in range(i+1, q):
+            pairs.append((i,j))
+    for (i,j) in pairs:
+        theta = math.pi * float(x[i]) * float(x[j])
+        qc.rzz(theta, i, j)
+    return qc
+
+def build_feature_map_inverse_circuit(z: np.ndarray) -> QuantumCircuit:
+
+    #Circuit for U(z)^† (inverse of feature map).
+    
+    z = np.asarray(z, dtype=float)
+    q = int(z.shape[0])
+    qc = QuantumCircuit(q, q)
+    # Inverse order: ZZ†, RX†, RZ†, H
+    pairs = []
+    for i in range(q):
+        for j in range(i+1, q):
+            pairs.append((i,j))
+    for (i,j) in reversed(pairs):
+        theta = math.pi * float(z[i]) * float(z[j])
+        qc.rzz(-theta, i, j)
+    for i in reversed(range(q)):
+        theta = math.pi * float(z[i])
+        qc.rx(-theta, i)
+        qc.rz(-theta, i)
+    for i in range(q):
+        qc.h(i)
+    return qc
+
+
+    #   Circuit whose probability of |0…0> equals |⟨ψ(z)|ψ(x)⟩|^2:
+    #  |0…0> --U(x)--> |ψ(x)⟩ --U(z)^†--> U(z)^† U(x) |0…0>
+    
+def build_compute_uncompute_circuit(x: np.ndarray, z: np.ndarray) -> QuantumCircuit:
+    
+    x = np.asarray(x, dtype=float)
+    z = np.asarray(z, dtype=float)
+    assert x.shape == z.shape
+    q = int(x.shape[0])
+    qc = QuantumCircuit(q, q)
+    # U(x)
+    for i in range(q):
+        qc.h(i)
+    for i in range(q):
+        theta = math.pi * float(x[i])
+        qc.rz(theta, i)
+        qc.rx(theta, i)
+    pairs = []
+    for i in range(q):
+        for j in range(i+1, q):
+            pairs.append((i,j))
+    for (i,j) in pairs:
+        theta = math.pi * float(x[i]) * float(x[j])
+        qc.rzz(theta, i, j)
+    # U(z)^†
+    for (i,j) in reversed(pairs):
+        theta = math.pi * float(z[i]) * float(z[j])
+        qc.rzz(-theta, i, j)
+    for i in reversed(range(q)):
+        theta = math.pi * float(z[i])
+        qc.rx(-theta, i)
+        qc.rz(-theta, i)
+    for i in range(q):
+        qc.h(i)
+    # Measure all qubits
+    qc.measure(range(q), range(q))
+    return qc
+
+def hardware_probe_qsvm_kernel(
+    X_probe: np.ndarray,
+    sampler: SamplerV2,
+    pass_manager,
+    shots: int,
+) -> Dict[str, float]:
+
+    
+    #Lightweight hardware kernel probe:
+    #  - Pick up to 4 pairs (xi, xj) from X_probe.
+    #  - For each pair, run a compute–uncompute circuit and estimate
+     #   K_hw(xi,xj) = P(|0…0>).
+    #  - Compare to ideal values from fidelity_kernel_matrix(X_probe,X_probe).
+    
+    X_probe = np.asarray(X_probe, dtype=float)
+    n, d = X_probe.shape
+    q = d
+    if n == 0:
+        return {"hardware_runtime_s": 0.0, "kernel_mae": 0.0, "kernel_mse": 0.0, "num_pairs": 0}
+
+    # Ideal kernel on probe subset
+    K_ideal = fidelity_kernel_matrix(X_probe, X_probe)
+
+    # Choose up to 4 pairs: 2 diagonal + 2 off-diagonal
+    pairs = []
+    for i in range(min(2, n)):
+        pairs.append((i, i))
+    if n >= 2:
+        pairs.append((0, 1))
+    if n >= 3:
+        pairs.append((1, 2))
+    pairs = pairs[:4]
+
+    circuits = []
+    ideal_vals = []
+    for (i,j) in pairs:
+        circuits.append(build_compute_uncompute_circuit(X_probe[i], X_probe[j]))
+        ideal_vals.append(float(K_ideal[i, j]))
+
+    isa_circuits = pass_manager.run(circuits)
+
+    print(f"[hardware] Submitting {len(isa_circuits)} QSVM kernel probe circuits to IBM backend...")
+    t0 = time.perf_counter()
+    job = sampler.run(isa_circuits, shots=shots)
+    primitive_result = job.result()
+    qpu_time = time.perf_counter() - t0
+    print(f"[hardware] QSVM kernel probe job finished in {qpu_time:.3f} s (wall-clock).")
+
+    bitstring_zero = "0"*q
+    hw_vals = []
+    for pub_res in primitive_result:
+        joined = pub_res.join_data()
+        counts = joined.get_counts()
+        total = sum(counts.values())
+        if total > 0:
+            p0 = counts.get(bitstring_zero, 0) / total
+        else:
+            p0 = 0.0
+        hw_vals.append(float(p0))
+
+    ideal_vals = np.array(ideal_vals, dtype=float)
+    hw_vals = np.array(hw_vals, dtype=float)
+    mae = float(np.mean(np.abs(hw_vals - ideal_vals))) if len(hw_vals) > 0 else 0.0
+    mse = float(np.mean((hw_vals - ideal_vals)**2)) if len(hw_vals) > 0 else 0.0
+
+    return {
+        "hardware_runtime_s": float(qpu_time),
+        "kernel_mae": mae,
+        "kernel_mse": mse,
+        "num_pairs": int(len(hw_vals)),
+    }
+
+# ------------********------------
+# ===================== Carbon helpers
+# ------------********------------
+
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+    return str(p)
+
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+    p = pathlib.Path(path)
+    ext = p.suffix.lower()
+    if ext == ".csv":
+        df = pd.read_csv(path)
+    else:
+        df = pd.read_excel(path)
+
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k,v in cols.items()
+                    if "country" in k or "nation" in k or k=="location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found in CO2 file.")
+
+    year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k,v in cols.items()
+                      if "intensity" in k
+                      or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k
+                      or "gco2" in k), None)
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column detected.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country","Year","Intensity"] if len(keep)==3 else ["Country","Intensity"]
+
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country", as_index=False).tail(1)
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0
+
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+def compute_carbon(perf_df: pd.DataFrame,
+                   intensity_df: pd.DataFrame,
+                   power_watts: float,
+                   pue: float):
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "power_watts": [power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ------------********------------
+# ===================== Plotting helpers
+# ------------********------------
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+# ------------********------------
+def plot_performance(df: pd.DataFrame, outdir: str):
+    g = df.groupby("pca_components_eff")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["pca_components_eff"], g["runtime_s"], marker="o")
+    plt.title("Performance: Runtime vs PCA components (QSVM IBM, light)")
+    plt.xlabel("PCA components"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_runtime_vs_components_qsvm_iris_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("pca_components_eff")["accuracy"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["pca_components_eff"], g2["accuracy"], marker="s")
+    plt.title("Performance: Mean accuracy vs PCA components (QSVM IBM, light)")
+    plt.xlabel("PCA components"); plt.ylabel("Accuracy")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_accuracy_vs_components_qsvm_iris_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_scalability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("pca_components_eff")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.loglog(g["pca_components_eff"], g["runtime_s"], "o")
+    plt.title("Scalability: Runtime (log–log) vs PCA components (QSVM IBM, light)")
+    plt.xlabel("PCA components"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_loglog_runtime_vs_components_qsvm_iris_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("pca_components_eff")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["pca_components_eff"], g2["peak_mem_mb"], marker="^")
+    plt.title("Scalability: Peak memory vs PCA components (QSVM IBM, light)")
+    plt.xlabel("PCA components"); plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_peakmem_vs_components_qsvm_iris_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_reliability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("pca_components_eff")["success"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["pca_components_eff"], g["success"], marker="o")
+    plt.ylim(-0.05, 1.05)
+    plt.title("Reliability: Success rate vs PCA components (QSVM IBM, light)")
+    plt.xlabel("PCA components"); plt.ylabel("Success rate")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_success_vs_components_qsvm_iris_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    data = [df[df["pca_components_eff"]==k]["accuracy"].values
+            for k in sorted(df["pca_components_eff"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["pca_components_eff"].unique()))
+    plt.title("Reliability: Accuracy distribution (QSVM IBM, light)")
+    plt.xlabel("PCA components"); plt.ylabel("Accuracy")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_accuracy_boxplot_qsvm_iris_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_carbon(df: pd.DataFrame, outdir: str):
+    top = df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8,5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Carbon: Top 15 countries (kgCO2e) — QSVM Iris IBM (light)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "carbon_top15_qsvm_iris_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(df["kgCO2e"], bins=30)
+    plt.title("Carbon: Emission distribution — QSVM Iris IBM (light)")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "carbon_distribution_qsvm_iris_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+# ===================== Single run: classical QSVM + hardware kernel probe
+# ------------********------------
+
+def run_single_qsvm_hardware_light(
+    n_components: int,
+    max_iter: int,
+    Cval: float,
+    test_size: float,
+    acc_tol: float,
+    seed: int,
+    sampler: SamplerV2,
+    pass_manager,
+    backend_name: str,
+    shots: int,
+) -> dict:
+    
+   # One QSVM experiment (Iris) with light IBM hardware usage:
+   #   - Full training/test done classically using the same quantum kernel as the noiseless script.
+   #   - IBM hardware used only for a tiny kernel "probe" on a few pairs of points.
+    
+    n_comp_eff = int(max(1, min(4, int(n_components))))
+
+    iris = datasets.load_iris()
+    X_all = iris.data.astype(np.float64)
+    y_all = iris.target.astype(np.int32)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_all, y_all, test_size=test_size, random_state=seed, stratify=y_all
+    )
+
+    scaler = StandardScaler()
+    Xtr = scaler.fit_transform(X_train)
+    pca = PCA(n_components=n_comp_eff, random_state=seed)
+    Xtr = pca.fit_transform(Xtr)
+    Xte = pca.transform(scaler.transform(X_test))
+
+    # Map each feature to [0,1] (fit on train only) for quantum feature map
+
+    xmin = Xtr.min(axis=0)
+    xmax = Xtr.max(axis=0)
+    span = np.maximum(xmax - xmin, 1e-9)
+    Xtr_q = np.clip((Xtr - xmin) / span, 0.0, 1.0)
+    Xte_q = np.clip((Xte - xmin) / span, 0.0, 1.0)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    # Classical kernel matrices (same as ideal QSVM script)
+
+    K_train = fidelity_kernel_matrix(Xtr_q, Xtr_q)
+    K_test  = fidelity_kernel_matrix(Xte_q, Xtr_q)
+
+    clf = SVC(
+        kernel="precomputed",
+        C=float(Cval),
+        max_iter=int(max_iter),
+        decision_function_shape="ovr",
+    )
+    clf.fit(K_train, y_train)
+    y_pred = clf.predict(K_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    df_scores = clf.decision_function(K_test)
+    hloss = safe_hinge_loss(y_test, df_scores, clf.classes_)
+
+    host_runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    peak_mb = peak / (1024**2)
+
+# ------------********------------
+    # ---- Hardware kernel probe (few circuits only) ----
+    if shots is not None and shots > 0:
+        n_train = Xtr_q.shape[0]
+        m = int(min(6, max(1, n_train)))
+        X_probe = Xtr_q[:m]
+        hw = hardware_probe_qsvm_kernel(X_probe, sampler, pass_manager, shots=shots)
+        hw_runtime = hw["hardware_runtime_s"]
+        kernel_mae = hw["kernel_mae"]
+        kernel_mse = hw["kernel_mse"]
+        num_pairs = hw["num_pairs"]
+    else:
+        hw_runtime = 0.0
+        kernel_mae = 0.0
+        kernel_mse = 0.0
+        num_pairs = 0
+
+    total_runtime_s = host_runtime + hw_runtime
+
+    return {
+        "pca_components": int(n_components),
+        "pca_components_eff": int(n_comp_eff),
+        "kernel": "quantum_fidelity_classical+probe",
+        "C": float(Cval),
+        "gamma": "n/a",
+        "degree": 0,
+        "max_iter": int(max_iter),
+        "test_size": float(test_size),
+        "seed": int(seed),
+        "accuracy": float(acc),
+        "hinge_loss": float(hloss),
+        "success": bool(acc >= acc_tol),
+        "runtime_s": float(total_runtime_s),
+        "host_runtime_s": float(host_runtime),
+        "hardware_runtime_s": float(hw_runtime),
+        "peak_mem_mb": float(peak_mb),
+        "n_train": int(X_train.shape[0]),
+        "n_test": int(X_test.shape[0]),
+        "backend_name": backend_name,
+        "shots": int(shots if shots is not None else 0),
+        "kernel_probe_mae": float(kernel_mae),
+        "kernel_probe_mse": float(kernel_mse),
+        "kernel_probe_pairs": int(num_pairs),
+    }
+
+# ------------********------------
+# ===================== Notebook entry point =====================
+# ------------********------------
+
+def run_qsvm_iris_ibm_hardware_notebook(
+    sizes=(1, 2, 3, 4),
+    steps: int = 1000,
+    trials: int = 10,
+    kernel: str = "quantum",
+    C: float = 1.0,
+    gamma: str = "scale",
+    degree: int = 3,
+    test_size: float = 0.3,
+    acc_tol: float = 0.95,
+    backend_name: str = "ibm_torino",
+    shots: int = 256,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = "carbon_by_country",
+):
+    
+     #Resource-light QSVM Iris benchmarks with IBM hardware:
+     #  - Training & inference identical to ideal QSVM (classical simulation of quantum kernel).
+     #  - IBM hardware is used only for a tiny kernel "probe" per run (few circuits),
+     #        to capture hardware runtime + kernel quality for carbon/perf comparison.
+     #
+        # Folders on Desktop:
+        #  Performance/
+        #  Scalability/
+        #  Reliability/
+        #  Carbon footprints/<outdir>/
+    
+    sizes = list(sizes)
+    print("[qsvm-iris-ibm-light] QSVM Iris IBM hardware (light) benchmark")
+    print("  PCA sizes:", sizes)
+    print(f"  steps/max_iter={steps}, trials={trials}, test_size={test_size}, acc_tol={acc_tol}")
+    print(f"  backend={backend_name}, shots={shots}")
+    print(f"  C={C}, gamma(ignored)={gamma}, degree(ignored)={degree}")
+    print(f"  excel_filename={excel_filename}")
+    print(f"  device_power_watts={device_power_watts}, PUE={pue}, year_select={year_select}, outdir='{outdir}'")
+
+    # Desktop output folders
+    desktop = pathlib.Path.home() / "Desktop"
+    perf_dir = desktop / "Performance"
+    scal_dir = desktop / "Scalability"
+    rel_dir  = desktop / "Reliability"
+    carb_root = desktop / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_root, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print("  Output folders:")
+    print(f"    Performance -> {perf_dir}")
+    print(f"    Scalability -> {scal_dir}")
+    print(f"    Reliability -> {rel_dir}")
+    print(f"    Carbon      -> {carb_dir}")
+
+    # IBM backend + SamplerV2
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+
+    rows: List[dict] = []
+    total_jobs = len(sizes) * trials
+    job_idx = 0
+
+    for comp in sizes:
+        for t in range(trials):
+            job_idx += 1
+            seed = 1000 + 17*int(comp) + t
+            print(f"\n[qsvm-iris-ibm-light] Job {job_idx}/{total_jobs}: "
+                  f"PCA={comp}, trial={t+1}/{trials}, seed={seed}")
+            row = run_single_qsvm_hardware_light(
+                n_components=int(comp),
+                max_iter=steps,
+                Cval=C,
+                test_size=test_size,
+                acc_tol=acc_tol,
+                seed=seed,
+                sampler=sampler,
+                pass_manager=pm,
+                backend_name=backend.name,
+                shots=shots,
+            )
+            rows.append(row)
+            print(f"    -> acc={row['accuracy']:.3f}, runtime={row['runtime_s']:.4f}s, "
+                  f"success={int(row['success'])}, "
+                  f"hw_probe_mae={row['kernel_probe_mae']:.4f}")
+
+    df = pd.DataFrame(rows)
+    print("\n[qsvm-iris-ibm-light] Finished all runs. Example rows:")
+    print(df.head())
+
+# ------------********------------
+    # ---------- Performance ----------
+    perf_xlsx = perf_dir / "performance_qsvm_iris_ibm_hardware.xlsx"
+    perf_agg = df.groupby("pca_components_eff").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        std_runtime_s=("runtime_s","std"),
+        mean_host_runtime_s=("host_runtime_s","mean"),
+        mean_hardware_runtime_s=("hardware_runtime_s","mean"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        mean_accuracy=("accuracy","mean"),
+        std_accuracy=("accuracy","std"),
+        success_rate=("success","mean"),
+        mean_train_samples=("n_train","mean"),
+        mean_test_samples=("n_test","mean"),
+        mean_kernel_probe_mae=("kernel_probe_mae","mean"),
+        mean_kernel_probe_mse=("kernel_probe_mse","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(df, str(perf_dir))
+    print(f"[qsvm-iris-ibm-light] Performance Excel written to: {perf_xlsx}")
+
+# ------------********------------
+    # ---------- Scalability ----------
+    scal_xlsx = scal_dir / "scalability_qsvm_iris_ibm_hardware.xlsx"
+    scal_agg = df.groupby("pca_components_eff").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        std_runtime_s=("runtime_s","std"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        std_peak_mem_mb=("peak_mem_mb","std"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_xlsx, engine="openpyxl") as w:
+            df[["pca_components_eff","runtime_s","peak_mem_mb"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            scal_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_scalability(df, str(scal_dir))
+    print(f"[qsvm-iris-ibm-light] Scalability Excel written to: {scal_xlsx}")
+
+# ------------********------------
+    # ---------- Reliability ----------
+    rel_xlsx = rel_dir / "reliability_qsvm_iris_ibm_hardware.xlsx"
+    rel_agg = df.groupby("pca_components_eff").agg(
+        success_rate=("success","mean"),
+        mean_acc=("accuracy","mean"),
+        std_acc=("accuracy","std"),
+        mean_hinge=("hinge_loss","mean"),
+        mean_kernel_probe_mae=("kernel_probe_mae","mean"),
+        mean_kernel_probe_mse=("kernel_probe_mse","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_xlsx, engine="openpyxl") as w:
+            df[["pca_components_eff","seed","accuracy","hinge_loss","success",
+                "kernel_probe_mae","kernel_probe_mse"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability(df, str(rel_dir))
+    print(f"[qsvm-iris-ibm-light] Reliability Excel written to: {rel_xlsx}")
+
+# ------------********------------
+    # ---------- Carbon ----------
+    excel_path = resolve_excel_path_notebook(excel_filename)
+    intensity_df = None
+    try:
+        intensity_df = load_carbon_excel(excel_path, year_select=year_select)
+        print(f"[carbon] Loaded CO2 intensity table from: {excel_path}")
+    except Exception as e:
+        print(f"[carbon] ERROR reading '{excel_path}': {e}")
+        print("[carbon] Skipping carbon benchmark.")
+        intensity_df = None
+
+    carbon_df = None
+    summary_df = None
+
+    if intensity_df is not None:
+        carbon_df, summary_df = compute_carbon(
+            df, intensity_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_xlsx = carb_dir / "carbon_qsvm_iris_ibm_hardware.xlsx"
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_xlsx, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input")
+
+        plot_carbon(carbon_df, str(carb_dir))
+        print(f"[carbon] Carbon Excel written to: {carb_xlsx}")
+
+    print("\n[qsvm-iris-ibm-light] All benchmarks complete.")
+    return {
+        "perf_df": df,
+        "perf_dir": str(perf_dir),
+        "scal_dir": str(scal_dir),
+        "rel_dir": str(rel_dir),
+        "carbon_dir": str(carb_dir),
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }

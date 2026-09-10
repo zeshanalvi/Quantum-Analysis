@@ -1,0 +1,11 @@
+python classical_xor_nn_benchmarks.py ^
+  --sizes 2 4 8 16 ^
+  --steps 500 ^
+  --trials 10 ^
+  --augment-per-corner 32 --noise-std 0.05 ^
+  --lr 0.05 --l2 1e-4 --acc-tol 0.99 ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir carbon_by_country ^
+  --combine

@@ -1,0 +1,17 @@
+results = run_vqe_ibm_hardware_notebook(
+    sizes=(2,),            # N = 2 only
+    steps=3,               # 3 SPSA iterations
+    layers=1,              # minimal ansatz
+    seeds_per_N=1,         # single random start
+    lr=0.05,
+    J=1.0,
+    h=1.05,
+    periodic=False,
+    early_stop=True,
+    patience=2,
+    min_delta=1e-3,
+    backend_name="ibm_torino",  # or ibm_fez / ibm_marrakesh
+    shots=256,             # small shot budget
+    device_power_watts=65.0,
+    pue=1.2,
+)

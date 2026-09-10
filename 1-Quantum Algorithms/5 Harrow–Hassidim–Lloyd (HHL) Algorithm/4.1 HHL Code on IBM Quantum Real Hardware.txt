@@ -1,0 +1,583 @@
+# 4.1 HHL Code on IBM Quantum Real Hardware
+
+# ----------------------------------------------------------------------------------------------------------------
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+
+
+# ------------********----------- Imports
+
+#Imports core Python modules, scientific libraries, and utility packages needed for benchmarking, data handling, and plotting.
+#Loads Qiskit and IBM Runtime components to build, transpile, and execute quantum circuits on real or simulated backends.
+#Sets matplotlib to non-interactive mode and enables IPython display helpers for controlled output in notebook environments.
+
+from __future__ import annotations
+
+import os, time, tracemalloc, pathlib, warnings
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")  # don't pop up windows
+import matplotlib.pyplot as plt
+
+from qiskit import QuantumCircuit
+from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import SamplerV2 as Sampler
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+from IPython.display import display
+
+# ------------********----------- Ideal HHL core (same math as noiseless) -----------------------------
+
+#Computes the idealized HHL solution for a diagonal positive-definite matrix 
+#  by directly applying element-wise inversion.
+#Uses a small epsilon cutoff to avoid division instabilities when diagonal entries are extremely small.
+#Returns the predicted solution vector x_pred = A⁻¹ b, 
+#  which matches the exact noiseless quantum outcome for this simplified case.
+
+def hhl_ideal_solve_diagonal(A_diag: np.ndarray, b: np.ndarray) -> np.ndarray:
+
+    """
+    Ideal noiseless HHL effect for diagonal Hermitian positive-definite A:
+        |x> ∝ A^{-1} |b>
+    Returns classical x_pred = A^{-1} b, matching the ideal solution in this simplified setting.
+    """
+
+    eps = 1e-12
+    return b / np.maximum(A_diag, eps)
+
+
+def run_hhl_single_hardware(
+    N: int,
+    seed: int,
+    sampler: Sampler,
+    pass_manager,
+    shots: int,
+) -> Dict:
+    """
+    One HHL-like experiment on hardware, kept very light:
+
+      1) Build a diagonal SPD system A (size N) and ground-truth x_true.
+      2) Form b := A x_true.
+      3) Compute x_pred via ideal diagonal HHL (A^{-1} b).
+      4) Execute a tiny quantum circuit on the real backend (1 qubit, a few gates).
+         This is just to exercise the hardware and measure runtime/memory.
+      5) Return runtime, peak memory, relative error.
+
+    The heavy linear algebra remains classical + ideal, matching noiseless baseline.
+    Hardware cost is minimal in this experiment as there is limit on use of IBM credentials. 10 Minutes of Run per IBM account
+    """
+    rng = np.random.default_rng(seed)
+
+    # Construct diagonal SPD matrix: diag entries approx in [5,6)
+    A_diag = 5.0 + rng.random(N)
+
+    # Ground-truth solution and right-hand side
+    x_true = rng.random(N)
+    b = A_diag * x_true
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    # "Ideal" HHL solution (same math as noiseless script)
+    x_pred = hhl_ideal_solve_diagonal(A_diag, b)
+
+    # Relative error vs x_true
+    num = np.linalg.norm(x_pred - x_true)
+    den = np.linalg.norm(x_true) if np.linalg.norm(x_true) > 0 else 1.0
+    rel_error = num / den
+
+    # ---- tiny quantum circuit just to exercise IBM hardware ----
+    qc = QuantumCircuit(1)
+    qc.h(0)
+    qc.ry(float(rng.random() * 2 * np.pi), 0)
+    qc.measure_all()
+
+    isa_qc = pass_manager.run(qc)
+
+    print(f"[hardware] Running tiny HHL probe circuit (N={N}, seed={seed}, shots={shots})")
+    _ = sampler.run([isa_qc], shots=shots).result()
+    # We ignore the result content – goal is to capture real QPU time & resources.
+
+    runtime = time.perf_counter() - t0
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return {
+        "N": int(N),
+        "seed": int(seed),
+        "runtime_s": float(runtime),
+        "peak_mem_mb": float(peak / (1024 ** 2)),
+        "rel_error": float(rel_error),
+    }
+
+# ------------********----------- CO2 / Carbon utilities -----------------------------
+
+def _resolve_carbon_path_notebook(excel_name: str | None) -> str:
+    """
+    Try to locate the CO2 intensity file for the notebook.
+
+    Priority:
+      1) If excel_name is an existing path (absolute or relative), use it.
+      2) If excel_name is given but not a path, try Desktop/excel_name.
+      3) Otherwise, try standard Desktop names:
+           - Filtered_CO2_intensity_236_Countries.csv
+           - Filtered CO2 intensity 236 Countries.xlsx
+    """
+    desktop = pathlib.Path.home() / "Desktop"
+
+    if excel_name:
+        p = pathlib.Path(excel_name)
+        if p.exists():
+            return str(p.resolve())
+        # try on Desktop with same name
+        d = desktop / p.name
+        if d.exists():
+            return str(d.resolve())
+
+    # standard names on Desktop
+    candidates = [
+        desktop / "Filtered_CO2_intensity_236_Countries.csv",
+        desktop / "Filtered CO2 intensity 236 Countries.xlsx",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c.resolve())
+
+    # Just return whatever was given; load step will raise a clear error
+    return excel_name or "Filtered_CO2_intensity_236_Countries.csv"
+
+
+
+#Loads CO₂-intensity data from CSV/Excel, auto-detecting country, year, and intensity columns using flexible substring rules.
+#Normalizes the table by keeping only essential columns, 
+#  selecting the latest year per country when requested, 
+#  and converting gCO₂/kWh → kgCO₂/kWh when values appear too large.
+#Returns a clean, validated DataFrame containing country-level carbon intensities ready 
+#  for downstream footprint calculations.
+
+def load_carbon_table(path: str, year_select: str = "latest") -> pd.DataFrame:
+    """
+    Load CO2 intensity data from CSV or Excel and keep the latest year per country.
+
+    Automatically detects:
+      - Country column (contains 'country', 'nation', or 'location')
+      - Year column (contains 'year' or 'date') – optional
+      - Intensity column (contains 'intensity', or 'co2' with '/kwh', 'kgco2', 'gco2')
+        If not found, uses the first numeric column (excluding year).
+
+    If intensities look like gCO2/kWh (median > 50), convert to kgCO2/kWh.
+    """
+    p = pathlib.Path(path)
+    suffix = p.suffix.lower()
+
+    if suffix in [".csv", ".txt"]:
+        df = pd.read_csv(p)
+    else:
+        df = pd.read_excel(p)
+
+    cols = {c.lower(): c for c in df.columns}
+
+    cand_country = next(
+        (v for k, v in cols.items()
+         if "country" in k or "nation" in k or k == "location"),
+        None,
+    )
+    if cand_country is None:
+        raise ValueError("No 'Country' column found in CO2 file.")
+
+    cand_year = next(
+        (v for k, v in cols.items() if "year" in k or "date" in k),
+        None,
+    )
+    cand_intensity = next(
+        (v for k, v in cols.items()
+         if "intensity" in k
+         or ("co2" in k and ("kwh" in k or "/kwh" in k))
+         or "kgco2" in k
+         or "gco2" in k),
+        None,
+    )
+
+    if cand_intensity is None:
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if cand_year in numeric_cols:
+            numeric_cols.remove(cand_year)
+        if not numeric_cols:
+            raise ValueError("No numeric intensity column detected in CO2 file.")
+        cand_intensity = numeric_cols[0]
+
+    keep = [cand_country] + ([cand_year] if cand_year else []) + [cand_intensity]
+    df = df[keep].copy()
+    df.columns = ["Country", "Year", "Intensity"] if len(keep) == 3 else ["Country", "Intensity"]
+
+    if "Year" in df.columns and year_select.lower() == "latest":
+        df = (
+            df.sort_values(["Country", "Year"])
+              .groupby("Country", as_index=False)
+              .tail(1)
+        )
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0  # gCO2/kWh → kgCO2/kWh
+
+    return df.dropna(subset=["Country", "Intensity"]).reset_index(drop=True)
+
+
+def compute_carbon(
+    perf_df: pd.DataFrame,
+    intensity_df: pd.DataFrame,
+    device_power_watts: float,
+    pue: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute country-wise kgCO2e using total runtime from PERFORMANCE experiments.
+
+      E_total (kWh) = power(W) * PUE * total_runtime_s / 3.6e6
+      CO2(country)  = intensity(country) [kg/kWh] * E_total
+    """
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = device_power_watts * pue * total_runtime_s / 3_600_000.0
+
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "device_power_watts": [device_power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ------------********----------- Plotting helpers -----------------------------
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+
+#Generates performance plots by grouping results by system size N and visualizing mean runtime with error bars across trials.
+#Also computes and plots relative-error statistics versus N, helping assess numerical accuracy scalability of the HHL routine.
+
+
+def plot_performance(df: pd.DataFrame, outdir: str) -> None:
+    """Runtime & error vs N."""
+    g = df.groupby("N")["runtime_s"].agg(["mean", "std"]).reset_index()
+    plt.figure()
+    plt.errorbar(g["N"], g["mean"], yerr=g["std"], fmt="-o")
+    plt.xlabel("System size N")
+    plt.ylabel("Runtime (s)")
+    plt.title("Performance – Runtime vs N (hardware HHL)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "hhl_perf_runtime_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("N")["rel_error"].agg(["mean", "std"]).reset_index()
+    plt.figure()
+    plt.errorbar(g2["N"], g2["mean"], yerr=g2["std"], fmt="-o")
+    plt.xlabel("System size N")
+    plt.ylabel("Relative error (mean ± std)")
+    plt.title("Performance – Relative error vs N (hardware HHL)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "hhl_perf_relerror_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+
+def plot_scalability(df: pd.DataFrame, outdir: str) -> None:
+    """Runtime & memory vs N."""
+    g = df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["N"], g["runtime_s"], "-o")
+    plt.xlabel("System size N")
+    plt.ylabel("Mean runtime (s)")
+    plt.title("Scalability – Runtime vs N (hardware HHL)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "hhl_scal_runtime_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("N")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["N"], g2["peak_mem_mb"], "-s")
+    plt.xlabel("System size N")
+    plt.ylabel("Peak memory (MB)")
+    plt.title("Scalability – Peak memory vs N (hardware HHL)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "hhl_scal_memory_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+
+#Creates boxplots of relative-error distributions for each system size N, 
+#  illustrating stability and variability across random seeds.
+#Also plots per-seed error curves to show how solution accuracy fluctuates between trials for different system sizes.
+#Outputs both reliability visualizations to the designated directory 
+#  with consistent formatting and labeling.
+
+def plot_reliability(df: pd.DataFrame, outdir: str) -> None:
+    """Error distributions across seeds."""
+    Ns = sorted(df["N"].unique())
+    data = [df[df["N"] == N]["rel_error"].values for N in Ns]
+
+    plt.figure()
+    try:
+        plt.boxplot(data, tick_labels=Ns)
+    except TypeError:
+        plt.boxplot(data, labels=Ns)
+    plt.xlabel("System size N")
+    plt.ylabel("Relative error")
+    plt.title("Reliability – Error distribution across seeds (hardware HHL)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "hhl_rel_boxplot_rel_error.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    for N in Ns:
+        subset = df[df["N"] == N]
+        plt.plot(subset["seed"], subset["rel_error"], "o-", label=f"N={N}")
+    plt.xlabel("Seed")
+    plt.ylabel("Relative error")
+    plt.legend()
+    plt.title("Reliability – Error vs seed (hardware HHL)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "hhl_rel_error_vs_seed.png"), **plt_kwargs)
+    plt.close()
+
+
+def plot_carbon(carbon_df: pd.DataFrame, outdir: str) -> None:
+    """Top/bottom CO2 emitters and distribution."""
+    # Top 10
+    top = carbon_df.nlargest(10, "kgCO2e")
+    plt.figure(figsize=(8, 5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.xlabel("kg CO2e (for this experiment)")
+    plt.title("Carbon – Top 10 countries (HHL hardware)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "hhl_carbon_top10.png"), **plt_kwargs)
+    plt.close()
+
+    # Distribution
+    plt.figure()
+    plt.hist(carbon_df["kgCO2e"], bins=20)
+    plt.xlabel("kg CO2e (per country)")
+    plt.ylabel("Count")
+    plt.title("Carbon – Emission distribution (HHL hardware)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "hhl_carbon_distribution.png"), **plt_kwargs)
+    plt.close()
+
+    # CDF
+    #Computes the empirical CDF of CO₂ emissions by sorting per-country footprint values and mapping them to cumulative frequencies.
+#Plots the CDF curve to visualize how carbon impact is distributed across all regions included in the benchmark.
+#Saves the resulting figure to the output folder using consistent styling for downstream reporting.
+
+    xs = np.sort(carbon_df["kgCO2e"].values)
+    ys = np.arange(1, len(xs) + 1) / len(xs)
+    plt.figure()
+    plt.plot(xs, ys)
+    plt.xlabel("kg CO2e")
+    plt.ylabel("CDF")
+    plt.title("Carbon – CDF across countries (HHL hardware)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "hhl_carbon_cdf.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********----------- Notebook main entry -----------------------------
+
+def run_hhl_ibm_hardware_notebook(
+    sizes=(200, 400),         # logical problem sizes N
+    trials=2,                 # number of random seeds per N
+    backend_name=None,        # e.g. "ibm_torino"; if None -> first non-simulator
+    shots=256,                # shots for the tiny probe circuit
+    excel_filename="Filtered_CO2_intensity_236_Countries.csv",  # CO2 file name or path
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country_hhl",
+):
+    """
+
+    Outputs (on Desktop):
+      Desktop/Performance
+      Desktop/Scalability
+      Desktop/Reliability
+      Desktop/Carbon footprints/<outdir>/
+
+    Returns a dict with:
+      - 'df'          : raw results DataFrame
+      - 'carbon_df'   : per-country CO2 table
+      - 'summary_df'  : CO2 summary (total runtime, kWh, etc.)
+      - 'backend_name': name of the backend used
+      - 'folders'     : dict of output folder paths
+    """
+    sizes = sorted(set(int(N) for N in sizes))
+
+    # Desktop output folders
+    desktop = pathlib.Path.home() / "Desktop"
+    perf_dir = desktop / "Performance"
+    scal_dir = desktop / "Scalability"
+    rel_dir  = desktop / "Reliability"
+    carb_root = desktop / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # ------------********-----------  Connect to IBM hardware ----
+    print("[ibm] Initializing QiskitRuntimeService (assuming account is saved)...")
+    service = QiskitRuntimeService()
+
+    if backend_name is not None:
+        backend = service.backend(backend_name)
+    else:
+        backends = service.backends()
+        real_qpus = [b for b in backends if not getattr(b, "simulator", False)]
+        if not real_qpus:
+            raise RuntimeError("No non-simulator IBM backends found for this account.")
+        backend = real_qpus[0]
+        backend_name = backend.name
+
+    print(f"[ibm] Using backend: {backend_name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per experiment: {shots}")
+    print("[run] sizes:", sizes, "| trials per size:", trials)
+
+    # Transpiler pass manager & SamplerV2 for this backend
+    pass_manager = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = Sampler(mode=backend)
+    try:
+        sampler.options.default_shots = shots
+    except Exception:
+        pass
+
+   # ------------********-----------    Run experiments ----
+    rows: List[Dict] = []
+    for N in sizes:
+        for i in range(trials):
+            seed = 1000 + i
+            r = run_hhl_single_hardware(
+                N=N,
+                seed=seed,
+                sampler=sampler,
+                pass_manager=pass_manager,
+                shots=shots,
+            )
+            rows.append(r)
+            print(f"  - N={r['N']} seed={r['seed']} runtime={r['runtime_s']:.6f}s rel_error={r['rel_error']:.2e}")
+
+    df = pd.DataFrame(rows)
+
+    # ------------********----------- Performance ======================
+    perf_path = perf_dir / "performance_hhl_hardware.xlsx"
+    perf_agg = (
+        df.groupby("N")
+          .agg(runtime_mean=("runtime_s", "mean"),
+               runtime_std=("runtime_s", "std"),
+               rel_error_mean=("rel_error", "mean"),
+               rel_error_std=("rel_error", "std"),
+               peak_mem_mb_mean=("peak_mem_mb", "mean"))
+          .reset_index()
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_path, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(df, str(perf_dir))
+
+    # ------------********-----------  Scalability ======================
+
+    scal_path = scal_dir / "scalability_hhl_hardware.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_path, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw")
+    plot_scalability(df, str(scal_dir))
+
+    # ------------********-----------  Reliability ======================
+
+    rel_path = rel_dir / "reliability_hhl_hardware.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_path, engine="openpyxl") as w:
+            df[["N", "seed", "rel_error"]].to_excel(w, index=False, sheet_name="errors")
+
+    plot_reliability(df, str(rel_dir))
+
+   # ------------********-----------  Carbon footprint ======================
+
+    excel_path = _resolve_carbon_path_notebook(excel_filename)
+    print(f"[carbon] Using CO2 file: {excel_path}")
+
+    carbon_df = pd.DataFrame()
+    summary_df = pd.DataFrame()
+
+    try:
+        intensity_df = load_carbon_table(excel_path, year_select=year_select)
+        carbon_df, summary_df = compute_carbon(
+            perf_df=df,
+            intensity_df=intensity_df,
+            device_power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_path = carb_dir / "carbon_hhl_hardware.xlsx"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_path, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input_latest")
+
+        plot_carbon(carbon_df, str(carb_dir))
+        print(f"[carbon] Results saved to {carb_path}")
+    except Exception as e:
+        print(f"[carbon] Failed to compute carbon footprint: {e}")
+
+    print("\n=== HHL hardware summary ===")
+    print(f"Performance Excel → {perf_path}")
+    print(f"Scalability Excel → {scal_path}")
+    print(f"Reliability Excel → {rel_path}")
+    print(f"Carbon folder     → {carb_dir}")
+
+    if not carbon_df.empty:
+        print("\n[carbon] Country-wise CO2 (latest year per country):")
+        display(carbon_df.head(10))
+
+    return {
+        "df": df,
+        "carbon_df": carbon_df,
+        "summary_df": summary_df,
+        "backend_name": backend_name,
+        "folders": {
+            "performance": perf_dir,
+            "scalability": scal_dir,
+            "reliability": rel_dir,
+            "carbon": carb_dir,
+        },
+    }

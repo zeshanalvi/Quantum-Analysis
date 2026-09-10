@@ -1,0 +1,8 @@
+python quantum_dj_noiseless.py ^
+More?   --sizes 6 8 10 12 ^
+More?   --trials 10 ^
+More?   --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+More?   --device-power-watts 65 --pue 1.2 ^
+More?   --year-select latest ^
+More?   --outdir carbon_by_country ^
+More?   --combine

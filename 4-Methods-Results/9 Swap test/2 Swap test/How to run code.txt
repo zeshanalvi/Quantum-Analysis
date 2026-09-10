@@ -1,0 +1,11 @@
+python swap_test_benchmarks.py ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir "%USERPROFILE%\Desktop\SwapTestOutputs" ^
+  --combine --workers 4 ^
+  --dim-min 128 --dim-max 4096 ^
+  --pairs 1000 --repeats 2 ^
+  --distribution normal ^
+  --normalize ^
+  --shots 4096

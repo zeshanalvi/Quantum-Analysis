@@ -1,0 +1,12 @@
+python qnn_xor_noiseless_benchmarks.py ^
+  --sizes 2 4 8 16 ^
+  --steps 300 ^
+  --trials 5 ^
+  --augment-per-corner 16 --noise-std 0.05 ^
+  --lr 0.05 --acc-tol 0.99 ^
+  --optimizer spsa --spsa-a0 0.1 --spsa-c0 0.2 ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir carbon_by_country ^
+  --combine --workers 4

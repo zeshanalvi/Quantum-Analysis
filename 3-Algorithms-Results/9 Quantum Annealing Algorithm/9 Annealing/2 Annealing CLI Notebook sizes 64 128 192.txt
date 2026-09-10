@@ -1,0 +1,20 @@
+results_qa_ibm = run_quantum_annealing_ibm_hardware_notebook(
+    sizes=(64, 128, 192),                         # same sizes as noiseless script
+    steps=1000,                                   # anneal integration steps
+    trials=10,                                    # trials per N
+    p=0.2,                                        # ER graph edge probability
+    field_strength=0.1,                           # h_i = field_strength * s★_i
+    Gamma=1.0,                                    # initial transverse field Γ
+    gap_tol=0.01,                                 # success if (E - E*)/|E*| ≤ gap_tol
+
+    backend_name="ibm_torino",                    # or ibm_fez / ibm_marrakesh
+    shots=256,                                    # tiny probe shots
+
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",  # lives on Desktop
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country",
+)
+
+results_qa_ibm["perf_df"].head()

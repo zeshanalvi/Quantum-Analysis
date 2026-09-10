@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# Quantum H/W Based Empirical Evaluation: Quantum Annealing on Real IBM Quantum Hardware Devices
+# ----------------------------------------------------------------------------------------------------------------
+
+# quantum_annealing_ibm_hardware_notebook.py
+# Full updated version with SamplerV2 + ISA transpilation
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports
+#These imports set up filesystem access, timing, warnings, memory profiling, and core numerical utilities for the experiment workflow.
+#They configure pandas for data handling and Matplotlib with a non-interactive backend 
+#    to generate PNG plots in headless environments.
+#Qiskit Runtime, SamplerV2, and transpiler pass managers are included to 
+#    run and manage lightweight quantum hardware probe circuits.
+
+import os, time, warnings, pathlib, tracemalloc, math
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")   # only for saving PNGs
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+# ========================= Core Quantum Annealing (same physics as noiseless) =========================
+
+def make_planted_ising(N: int, p: float, field_strength: float, seed: int):
+    
+    # ER(N,p) graph; planted s★ ∈ {±1}; set J_ij = s★_i s★_j on edges; h_i = field_strength * s★_i.
+    # Then E(s★) = -(#edges) - field_strength * N  (unique optimum if field_strength>0).
+    
+    rng = np.random.default_rng(seed)
+    s_star = rng.choice([-1, 1], size=N).astype(np.int8)
+    edges = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            if rng.random() < p:
+                edges.append((i, j))
+    m = len(edges)
+    J = {(i, j): int(s_star[i]) * int(s_star[j]) for (i, j) in edges}
+    h = field_strength * s_star.astype(np.float64)
+    E_star = -m - field_strength * N
+    return edges, J, h, s_star, E_star
+
+#def energy_of computes the Ising Hamiltonian energy by summing all pairwise interaction terms over edges and subtracting the linear field term.
+def energy_of(spins: np.ndarray, edges, J, h) -> float:
+    e = 0.0
+    for (i, j) in edges:
+        e -= J[(i, j)] * spins[i] * spins[j]
+    e -= np.dot(h, spins)
+    return float(e)
+
+#def build_neighbors constructs an adjacency list mapping each spin to its neighbors and couplings, 
+#  enabling efficient local energy and update calculations.
+def build_neighbors(N, edges, J):
+    nbrs_by_i = {i: [] for i in range(N)}
+    for (i, j) in edges:
+        Jij = J[(i, j)]
+        nbrs_by_i[i].append((j, Jij))
+        nbrs_by_i[j].append((i, Jij))
+    return nbrs_by_i
+
+# ------------------------- Mean-field QA dynamics -------------------------
+
+def mean_field_rhs(m: np.ndarray, s: float, Gamma: float, nbrs_by_i, h: np.ndarray) -> np.ndarray:
+    
+    # Compute RHS dm/dt for all spins at schedule point s.
+    # m shape: (N,3) with rows [mx, my, mz] per spin; |m_i|≈1 ideally.
+    
+    N = m.shape[0]
+    # Transverse field along x
+    Bx = (1.0 - s) * Gamma
+    # Longitudinal field from neighbors + planted h
+    Bz = np.zeros(N, dtype=np.float64)
+    mz = m[:, 2]
+    for i in range(N):
+        acc = 0.0
+        for (j, Jij) in nbrs_by_i[i]:
+            acc += Jij * mz[j]
+        Bz[i] = s * (acc + h[i])
+
+    # dm_i/dt = 2 m_i × B_i, where B_i = (Bx, 0, Bz_i)
+    mx = m[:, 0]
+    my = m[:, 1]
+    cross_x = 2.0 * (my * Bz)               # 2 (my * Bz - mz * 0)
+    cross_y = 2.0 * (m[:, 2] * Bx - mx * Bz)
+    cross_z = -2.0 * (my * Bx)              # 2 (mx * 0 - my * Bx)
+
+    rhs = np.stack([cross_x, cross_y, cross_z], axis=1)
+    return rhs
+
+def renorm_rows(m: np.ndarray, eps: float = 1e-12):
+    norms = np.linalg.norm(m, axis=1, keepdims=True)
+    norms = np.maximum(norms, eps)
+    m /= norms
+
+def evolve_mean_field_QA(N: int, edges, J, h: np.ndarray,
+                         Gamma: float, steps: int, seed: int) -> np.ndarray:
+    
+    # Integrate d m/dt = 2 m × B(s) from s=0→1 with Heun (RK2) in 's' with dt = 1/steps.
+   #   Initial m: random on Bloch sphere (seeded).
+   #   Returns final m shape (N,3).
+
+    rng = np.random.default_rng(seed)
+    m = rng.normal(size=(N, 3))
+    renorm_rows(m)
+
+    nbrs_by_i = build_neighbors(N, edges, J)
+    dt = 1.0 / float(steps)
+
+    for k in range(steps):
+        s = k * dt
+        k1 = mean_field_rhs(m, s, Gamma, nbrs_by_i, h)
+        m_temp = m + dt * k1
+        renorm_rows(m_temp)
+        k2 = mean_field_rhs(m_temp, s + dt, Gamma, nbrs_by_i, h)
+        m += (dt / 2.0) * (k1 + k2)
+        renorm_rows(m)
+
+    return m
+
+# ------------------------- Single run (noiseless core, no hardware) -------------------------
+
+def run_single_qa_core(N: int, steps: int, p: float, field_strength: float,
+                       Gamma: float, gap_tol: float, seed: int) -> dict:
+    
+    #   Core QA physics + host runtime/memory (no IBM hardware).
+    #   We'll wrap this with a hardware probe later.
+    
+    edges, J, h, s_star, E_star = make_planted_ising(N, p, field_strength, seed)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    # Integrate mean-field QA
+    m = evolve_mean_field_QA(N, edges, J, h, Gamma, steps, seed + 1)
+
+    # Measurement: round sign of m_z
+    spins = np.sign(m[:, 2]).astype(np.int8)
+    spins[spins == 0] = 1  # tie -> +1
+    best_E = energy_of(spins, edges, J, h)
+
+    runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    gap = (best_E - E_star) / (abs(E_star) + 1e-12)
+    success = bool(gap <= gap_tol)
+
+    return {
+        "n": N,
+        "edges": len(edges),
+        "p": p,
+        "steps": steps,
+        "Gamma": Gamma,
+        "field_strength": field_strength,
+        "seed": seed,
+        "best_energy": float(best_E),
+        "opt_energy": float(E_star),
+        "gap": float(gap),
+        "success": success,
+        "runtime_s": float(runtime),
+        "peak_mem_mb": float(peak / (1024**2)),
+    }
+
+# ========================= Carbon I/O (latest year per country) =========================
+
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    
+    #  To Resolve the CO2 intensity file on Desktop (or absolute path).
+    #  Accepts .csv or .xlsx/.xls.
+    
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+
+    # Fallback to raw string (let pandas raise if not found)
+    return str(p)
+
+    # Load CO2 intensity table from CSV or Excel and keep latest year per country.
+    # Columns are auto-detected ("country", "year", "intensity"/"kgCO2"/"gCO2", etc.).
+    #   Intensity is returned in kgCO2e/kWh.
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+
+
+    p = pathlib.Path(path)
+    ext = p.suffix.lower()
+    if ext == ".csv":
+        df = pd.read_csv(path)
+    else:
+        df = pd.read_excel(path)
+
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k, v in cols.items()
+                    if "country" in k or "nation" in k or k == "location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found in CO2 file.")
+
+    year = next((v for k, v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k, v in cols.items()
+                      if "intensity" in k
+                      or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k
+                      or "gco2" in k), None)
+
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column detected.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country", "Year", "Intensity"] if len(keep) == 3 else ["Country", "Intensity"]
+
+    if "Year" in df.columns and year_select.lower() == "latest":
+        df = df.sort_values(["Country", "Year"]).groupby("Country", as_index=False).tail(1)
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:  # likely g/kWh, convert to kg/kWh
+        df["Intensity"] = df["Intensity"] / 1000.0
+
+    return df.dropna(subset=["Country", "Intensity"]).reset_index(drop=True)
+
+def compute_carbon(perf_df: pd.DataFrame, intensity_df: pd.DataFrame,
+                   power_watts: float, pue: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+   # Carbon from PERFORMANCE runtimes only (sum over all runs).
+    """
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "power_watts": [power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ========================= Plotting (same style as noiseless QA) =========================
+
+#plt_kwargs defines common Matplotlib save settings (resolution and tight layout) reused across all plots.
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+#def _boxplot_with_labels provides a compatibility wrapper to create boxplots with labels across Matplotlib versions.
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+
+#def plot_performance aggregates results by problem size and generates line plots for mean runtime 
+#   and mean optimality gap versus N, saving them as PNGs.
+def plot_performance(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["runtime_s"], marker="o")
+    plt.title("Performance: Runtime vs N"); plt.xlabel("N (spins)"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_runtime_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("n")["gap"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["n"], g2["gap"], marker="s")
+    plt.title("Performance: Mean optimality gap vs N"); plt.xlabel("N (spins)"); plt.ylabel("Gap")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_gap_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+def plot_scalability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.loglog(g["n"], g["runtime_s"], marker="o")
+    plt.title("Scalability: Runtime vs N (log-log)"); plt.xlabel("N (spins)"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_runtime_vs_N_loglog.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("n")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["n"], g2["peak_mem_mb"], marker="^")
+    plt.title("Scalability: Memory vs N"); plt.xlabel("N (spins)"); plt.ylabel("Mean peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_memory_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+#def plot_reliability visualizes solver reliability by plotting success rate versus problem size and a boxplot of optimality gap distributions.
+#It aggregates success probabilities by N and saves both line and boxplot figures to the reliability output directory.
+
+
+def plot_reliability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["success"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["success"], marker="o")
+    plt.ylim(-0.05, 1.05)
+    plt.title("Reliability: Success rate vs N (gap ≤ tol)"); plt.xlabel("N"); plt.ylabel("Success rate")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_success_vs_N.png"), **plt_kwargs)
+    plt.close()
+
+    data = [df[df["n"] == k]["gap"].values for k in sorted(df["n"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["n"].unique()))
+    plt.title("Reliability: Optimality gap distribution"); plt.xlabel("N"); plt.ylabel("Gap")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_gap_boxplot.png"), **plt_kwargs)
+    plt.close()
+
+#def plot_carbon summarizes environmental impact by plotting the top emitting countries as a horizontal bar chart and the overall CO₂ emission distribution histogram.
+def plot_carbon(df: pd.DataFrame, outdir: str):
+    top = df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8, 5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Carbon: Top 15 countries (kgCO2e)"); plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "carbon_top15.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(df["kgCO2e"], bins=30)
+    plt.title("Carbon: Emission distribution"); plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "carbon_distribution.png"), **plt_kwargs)
+    plt.close()
+
+# ========================= IBM Hardware helpers (SamplerV2 + preset pass manager) =========================
+
+def get_ibm_sampler(backend_name: str, shots: int):
+    
+    # Create a SamplerV2 primitive on a real IBM backend.
+    # Uses SamplerV2(mode=backend, ...) and a preset pass manager that
+    # transpiles to the backend's ISA (no raw 'h', etc.).
+    
+    print("[ibm] Initializing QiskitRuntimeService (using saved account)...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    # IMPORTANT: this pass manager targets backend.target → ISA-compliant circuits
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+
+    sampler = SamplerV2(mode=backend)  
+
+    return backend, sampler, pm
+
+def hardware_probe_once(sampler: SamplerV2, pass_manager, shots: int) -> float:
+   
+   # Minimal 2-qubit Bell-state circuit submitted to the real IBM backend.
+   # Returns wall-clock time spent waiting for this job.
+   
+    qc = QuantumCircuit(2)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.measure_all()
+
+    # Transpile to backend's ISA so it's accepted by SamplerV2
+    isa_qc = pass_manager.run(qc)
+
+    print("[hardware] Submitting small Bell test circuit...")
+    t0 = time.perf_counter()
+    job = sampler.run([isa_qc], shots=shots)
+    _ = job.result()  # ignore counts; only care about runtime
+    qpu_time = time.perf_counter() - t0
+    print(f"[hardware] Bell test finished in {qpu_time:.3f} s (wall-clock).")
+    return float(qpu_time)
+
+def run_single_hardware(N: int, steps: int, p: float, field_strength: float,
+                        Gamma: float, gap_tol: float, seed: int,
+                        sampler: SamplerV2, pass_manager,
+                        shots: int, backend_name: str) -> dict:
+    
+    
+    #One QA experiment:
+    #  - Run noiseless mean-field QA (same as classical script).
+    #  - Submit ONE small hardware probe circuit (SamplerV2) to IBM backend.
+    #  - Record host runtime, QPU probe time, and total runtime_s = host + qpu.
+    
+    print(f"[run_single] N={N}, seed={seed}, steps={steps}")
+
+    # 1) classical QA core
+    core = run_single_qa_core(N, steps, p, field_strength, Gamma, gap_tol, seed)
+    host_runtime = float(core["runtime_s"])
+
+    # 2) tiny hardware probe
+    qpu_time = hardware_probe_once(sampler, pass_manager, shots=shots)
+
+    core["host_runtime_s"] = host_runtime
+    core["qpu_probe_runtime_s"] = float(qpu_time)
+    core["runtime_s"] = host_runtime + qpu_time
+    core["backend_name"] = backend_name
+    core["shots"] = int(shots)
+
+    return core
+
+# ========================= Notebook entry point =========================
+#def run_quantum_annealing_ibm_hardware_notebook configures and launches a quantum annealing benchmark tailored for execution alongside IBM Quantum hardware probes.
+#It defines problem sizes, annealing parameters, success tolerances, backend/shots settings, and carbon-footprint inputs in one high-level entry point.
+
+def run_quantum_annealing_ibm_hardware_notebook(
+    sizes=(64, 128, 192),
+    steps: int = 1000,
+    trials: int = 10,
+    p: float = 0.2,
+    field_strength: float = 0.1,
+    Gamma: float = 1.0,
+    gap_tol: float = 0.01,
+    backend_name: str = "ibm_torino",
+    shots: int = 256,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = "carbon_by_country",
+):
+  
+    sizes = list(sizes)
+    print("[qa-ibm] Problem sizes:", sizes)
+    print(f"[qa-ibm] steps={steps}, trials={trials}, p={p}, field_strength={field_strength}, "
+          f"Gamma={Gamma}, gap_tol={gap_tol}")
+    print(f"[qa-ibm] Backend={backend_name}, shots={shots}")
+
+    # Output folders on Desktop
+    desktop = pathlib.Path.home() / "Desktop"
+    perf_dir = desktop / "Performance"
+    scal_dir = desktop / "Scalability"
+    rel_dir = desktop / "Reliability"
+    carb_root = desktop / "Carbon footprints"
+    carb_dir = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_root, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print(f"[qa-ibm] Output folders:")
+    print(f"  Performance -> {perf_dir}")
+    print(f"  Scalability -> {scal_dir}")
+    print(f"  Reliability -> {rel_dir}")
+    print(f"  Carbon      -> {carb_dir}")
+
+    # Connect to IBM backend
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+
+    
+    rows: List[dict] = []
+    total_jobs = len(sizes) * trials
+    job_idx = 0
+
+    for N in sizes:
+        for t in range(trials):
+            job_idx += 1
+            seed = 1000 + 17 * N + t  # deterministic seeds
+            print(f"\n[qa-ibm] Job {job_idx}/{total_jobs}: N={N}, trial={t+1}/{trials}, seed={seed}")
+            row = run_single_hardware(
+                N=N,
+                steps=steps,
+                p=p,
+                field_strength=field_strength,
+                Gamma=Gamma,
+                gap_tol=gap_tol,
+                seed=seed,
+                sampler=sampler,
+                pass_manager=pm,
+                shots=shots,
+                backend_name=backend.name,
+            )
+            rows.append(row)
+
+    perf_df = pd.DataFrame(rows)
+    print("\n[qa-ibm] Finished all runs. Example rows:")
+    print(perf_df.head())
+
+    # ---------------- Performance ----------------
+    perf_xlsx = perf_dir / "performance_qa_ibm_hardware.xlsx"
+    perf_agg = perf_df.groupby("n").agg(
+        mean_runtime_s=("runtime_s", "mean"),
+        std_runtime_s=("runtime_s", "std"),
+        mean_gap=("gap", "mean"),
+        std_gap=("gap", "std"),
+        success_rate=("success", "mean"),
+        mean_peak_mem_mb=("peak_mem_mb", "mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx, engine="openpyxl") as w:
+            perf_df.to_excel(w, index=False, sheet_name="runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(perf_df, str(perf_dir))
+    print(f"[qa-ibm] Performance Excel written to: {perf_xlsx}")
+
+    # ---------------- Scalability ----------------
+    scal_xlsx = scal_dir / "scalability_qa_ibm_hardware.xlsx"
+    scal_agg = perf_df.groupby("n").agg(
+        mean_runtime_s=("runtime_s", "mean"),
+        std_runtime_s=("runtime_s", "std"),
+        mean_peak_mem_mb=("peak_mem_mb", "mean"),
+        std_peak_mem_mb=("peak_mem_mb", "std"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_xlsx, engine="openpyxl") as w:
+            perf_df[["n", "runtime_s", "peak_mem_mb"]].to_excel(
+                w, index=False, sheet_name="from_perf_runs"
+            )
+            scal_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_scalability(perf_df, str(scal_dir))
+    print(f"[qa-ibm] Scalability Excel written to: {scal_xlsx}")
+
+    # ---------------- Reliability ----------------
+    rel_xlsx = rel_dir / "reliability_qa_ibm_hardware.xlsx"
+    rel_agg = perf_df.groupby("n").agg(
+        success_rate=("success", "mean"),
+        mean_gap=("gap", "mean"),
+        std_gap=("gap", "std"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_xlsx, engine="openpyxl") as w:
+            perf_df[["n", "seed", "gap", "success"]].to_excel(
+                w, index=False, sheet_name="runs_with_success"
+            )
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability(perf_df, str(rel_dir))
+    print(f"[qa-ibm] Reliability Excel written to: {rel_xlsx}")
+
+    # ---------------- Carbon (from PERFORMANCE runtimes only) ----------------
+    excel_path = resolve_excel_path_notebook(excel_filename)
+    intensity_df = None
+    try:
+        intensity_df = load_carbon_excel(excel_path, year_select=year_select)
+        print(f"[carbon] Loaded CO2 intensity table from: {excel_path}")
+    except Exception as e:
+        print(f"[carbon] ERROR reading '{excel_path}': {e}")
+        print("[carbon] Skipping carbon benchmark.")
+        intensity_df = None
+
+    carbon_df = None
+    summary_df = None
+
+    if intensity_df is not None:
+        carbon_df, summary_df = compute_carbon(
+            perf_df, intensity_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_excel = carb_dir / "carbon_qa_ibm_hardware.xlsx"
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_excel, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input")
+
+        plot_carbon(carbon_df, str(carb_dir))
+        print(f"[carbon] Carbon Excel written to: {carb_excel}")
+
+#This block finalizes the IBM quantum annealing benchmark by printing a completion message.
+#It returns a dictionary collecting all result DataFrames and output directory paths for performance, scalability, reliability, and carbon analysis.
+
+    print("\n[qa-ibm] All benchmarks complete.")
+    return {
+        "perf_df": perf_df,
+        "perf_dir": str(perf_dir),
+        "scal_dir": str(scal_dir),
+        "rel_dir": str(rel_dir),
+        "carbon_dir": str(carb_dir),
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }

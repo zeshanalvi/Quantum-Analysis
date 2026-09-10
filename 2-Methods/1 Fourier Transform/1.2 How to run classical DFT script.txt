@@ -1,0 +1,10 @@
+python classical_dft_benchmarks.py ^
+  --sizes 64 128 256 512 ^
+  --steps 50 ^
+  --trials 10 ^
+  --acc-tol 0.9 ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir carbon_by_country ^
+  --combine --workers 4

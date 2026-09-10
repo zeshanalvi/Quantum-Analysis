@@ -1,0 +1,13 @@
+results_dj_hw = run_dj_ibm_hardware_notebook(
+    sizes=(6, 8, 10, 12),                 
+    trials=10,                             
+    backend_name="ibm_torino",              # or "ibm_fez", "ibm_marrakesh", etc.
+    shots=256,                              #we can increase it 
+
+    # Carbon / device parameters (matching your noiseless setup):
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country",             # subfolder under Desktop/Carbon footprints
+)

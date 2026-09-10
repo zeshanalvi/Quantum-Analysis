@@ -1,0 +1,20 @@
+results_qsvm_ibm = run_qsvm_iris_ibm_hardware_notebook(
+    sizes=(1, 2, 3, 4),
+    steps=1000,
+    trials=10,
+    kernel="quantum",                      
+    C=1.0,
+    gamma="scale",                         
+    degree=3,                             
+    test_size=0.3,
+    acc_tol=0.95,
+    backend_name="ibm_torino",             # actual backend
+    shots=256,                             # very few circuits per run
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",  # file is on my Desktop
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country",
+)
+
+results_qsvm_ibm["perf_df"].head()

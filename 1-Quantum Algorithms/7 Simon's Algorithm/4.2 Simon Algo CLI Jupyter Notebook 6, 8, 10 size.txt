@@ -1,0 +1,14 @@
+results_simon_hw = run_simon_ibm_hardware_notebook(
+    sizes=(6,8,10,),                           
+    trials=10,                              
+    backend_name="ibm_torino",               # or "ibm_fez", "ibm_marrakesh", ...
+
+    shots=256,                               # hardware-only parameter, can keep small
+
+    # Carbon / device parameters (same as CLI):
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,                 # --device-power-watts 65
+    pue=1.2,                                 # --pue 1.2
+    year_select="latest",                    # --year-select latest
+    outdir="carbon_by_country",              # --outdir carbon_by_country
+)

@@ -1,0 +1,40 @@
+import os
+
+# Original CLI you gave:
+# python swap_test_benchmarks.py ^
+#   --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+#   --device-power-watts 65 --pue 1.2 ^
+#   --year-select latest ^
+#   --outdir "%USERPROFILE%\\Desktop\\SwapTestOutputs" ^
+#   --combine --workers 4 ^
+#   --dim-min 128 --dim-max 4096 ^
+#   --pairs 1000 --repeats 2 ^
+#   --distribution normal ^
+#   --normalize ^
+#   --shots 4096
+
+outdir = os.path.join(
+    os.environ.get("USERPROFILE", ""),
+    "Desktop",
+    "SwapTestOutputs_IBM",   # separate folder for IBM hardware results
+)
+
+results_swap_ibm = run_swap_test_ibm_hardware_notebook(
+    dim_min=128,
+    dim_max=4096,
+    pairs=1000,
+    repeats=2,
+    distribution="normal",
+    normalize=True,
+    shots=4096,
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir=outdir,
+    backend_name="ibm_torino",   # change this to your actual IBM backend name if needed
+    hw_pairs_per_dim=4,          # small number of hardware circuits per dimension (light)
+    hw_shots=1024,               # hardware shots per circuit (also kept light)
+)
+
+results_swap_ibm["perf_df"].head()

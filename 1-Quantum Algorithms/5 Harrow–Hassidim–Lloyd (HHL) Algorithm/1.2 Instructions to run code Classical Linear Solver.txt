@@ -1,0 +1,8 @@
+  python classical_linear_solver_benchmarks.py ^
+    --sizes 200 400 800 1200 ^
+    --trials 3 ^
+    --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+    --device-power-watts 65 --pue 1.2 ^
+    --year-select latest ^
+    --outdir carbon_by_country ^
+    --combine

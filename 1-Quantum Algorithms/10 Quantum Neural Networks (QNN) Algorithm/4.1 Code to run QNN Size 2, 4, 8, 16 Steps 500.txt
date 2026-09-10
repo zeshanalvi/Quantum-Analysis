@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# Quantum Neural Network for XOR . Real IBM Quantum Hardware
+# ----------------------------------------------------------------------------------------------------------------
+# qnn_xor_ibm_hardware_notebook.py
+# Quantum Neural Network for XOR:
+#   - Training: ideal (classical 4x4 unitary, fast SPSA)
+#   - Hardware: tiny probe per run (4 QNN circuits on IBM backend via SamplerV2)
+#   - Benchmarks: Performance, Scalability, Reliability, Carbon (Desktop folders)
+
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports
+#These imports provide filesystem utilities, timing, warnings control, memory profiling, and core numerical tools for the benchmark workflow.
+#They configure pandas for data handling and Matplotlib with a non-interactive backend for saving plots in headless environments.
+#Qiskit Runtime, SamplerV2, and transpiler pass managers are included to build and run lightweight quantum circuits on IBM hardware.
+
+import os, time, warnings, pathlib, tracemalloc, math
+from typing import List, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")   
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+# ------------********------------
+# =========================== XOR DATASET
+# ------------********------------
+
+#def make_xor_dataset constructs the XOR classification dataset with 
+#   optional Gaussian noise augmentation around each corner.
+#It supports reproducible sampling via a seed and clips augmented samples to a bounded input range.
+#The function returns stacked feature and label arrays suitable for training and evaluation.
+
+def make_xor_dataset(augment_per_corner: int = 0,
+                     noise_std: float = 0.05,
+                     seed: int | None = None):
+    """
+    XOR data + Gaussian augmentation (same as my noiseless experiment).
+    """
+    rng = np.random.default_rng(seed)
+    X_base = np.array([[0,0],[0,1],[1,0],[1,1]], dtype=np.float64)
+    y_base = np.array([[0],[1],[1],[0]], dtype=np.float64)
+    if augment_per_corner <= 0:
+        return X_base, y_base
+    X_list, y_list = [], []
+    for i in range(4):
+        X_list.append(X_base[i:i+1]); y_list.append(y_base[i:i+1])
+        noise = rng.normal(0.0, noise_std, size=(augment_per_corner, 2))
+        X_aug = np.clip(X_base[i] + noise, -0.25, 1.25)
+        y_aug = np.repeat(y_base[i:i+1], augment_per_corner, axis=0)
+        X_list.append(X_aug); y_list.append(y_aug)
+    X = np.vstack(X_list); y = np.vstack(y_list)
+    return X, y
+
+# ------------********------------
+# =========================== Classical 2-qubit QNN
+# ------------********------------
+
+#I2 defines the 2×2 complex identity matrix used as a base single-qubit operator
+
+I2 = np.eye(2, dtype=np.complex128)
+
+#def Ry and def Rz generate single-qubit rotation matrices about the Y and Z axes using half-angle trigonometric formulas.
+#CNOT_01 specifies a two-qubit controlled-NOT gate matrix with qubit 0 as control and qubit 1 as target.
+def Ry(theta: float) -> np.ndarray:
+    c = math.cos(theta/2.0); s = math.sin(theta/2.0)
+    return np.array([[c, -s],[s, c]], dtype=np.complex128)
+
+def Rz(theta: float) -> np.ndarray:
+    c = math.cos(theta/2.0); s = math.sin(theta/2.0)
+    return np.array([[c-1j*s, 0],[0, c+1j*s]], dtype=np.complex128)
+
+# CNOT control=0 → target=1
+CNOT_01 = np.array([
+    [1,0,0,0],
+    [0,1,0,0],
+    [0,0,0,1],
+    [0,0,1,0]
+], dtype=np.complex128)
+
+
+def layer_unitary(params_layer: np.ndarray) -> np.ndarray:
+    """
+    4×4 layer unitary for [ry0, ry1, rz0, rz1] with order:
+      RY0, RY1, CNOT(0→1), RZ0, RZ1
+    """
+    ry0, ry1, rz0, rz1 = params_layer
+    U = np.kron(Ry(ry0), I2)
+    U = np.kron(I2, Ry(ry1)) @ U
+    U = CNOT_01 @ U
+    U = np.kron(Rz(rz0), I2) @ U
+    U = np.kron(I2, Rz(rz1)) @ U
+    return U
+
+#def circuit_unitary composes a sequence of variational layers into a single two-qubit unitary matrix.
+#It left-multiplies each layer so that newer layers act first, matching the intended circuit execution order.
+
+def circuit_unitary(params: np.ndarray) -> np.ndarray:
+
+    U = np.eye(4, dtype=np.complex128)
+    for layer in params:
+        U = layer_unitary(layer) @ U
+    return U
+
+#def encode_states_matrix encodes classical 2D inputs into quantum feature states 
+#  using Y-rotations applied to a two-qubit |00⟩ reference state.
+#For each sample, it applies RY(π·x1) on qubit 0 and RY(π·x2) on qubit 1, storing the resulting state as a column.
+#The function returns a (4, N) matrix of encoded input kets ready for unitary evolution.
+
+def encode_states_matrix(X: np.ndarray) -> np.ndarray:
+   
+    N = X.shape[0]
+    S = np.zeros((4, N), dtype=np.complex128)
+    ket00 = np.zeros(4, dtype=np.complex128); ket00[0] = 1.0
+    for i in range(N):
+        x1, x2 = float(X[i,0]), float(X[i,1])
+        Uenc = np.kron(Ry(math.pi*x1), I2)
+        Uenc = np.kron(I2, Ry(math.pi*x2)) @ Uenc
+        S[:, i] = Uenc @ ket00
+    return S
+
+def probs_from_unitary(U: np.ndarray, S_in: np.ndarray) -> np.ndarray:
+    """
+    Vectorized: S_out = U @ S_in; return p (N,) with p_i = P(q1=1).
+    q1=1 corresponds to basis states |01> and |11>.
+    """
+    S_out = U @ S_in  # (4,N)
+    p = (np.abs(S_out[1,:])**2 + np.abs(S_out[3,:])**2).real
+    return p
+
+# ------------********------------
+# =========================== Loss & accuracy 
+# ------------********------------
+#def bce_loss computes the binary cross-entropy loss between predicted probabilities 
+#      and true labels with numerical clipping for stability.
+#It returns the mean loss value as a scalar float suitable for optimization tracking.
+#def accuracy_from_probs thresholds probabilities at 0.5 to 
+#      compute classification accuracy against the ground-truth labels.
+
+def bce_loss(p, y) -> float:
+    p = np.asarray(p).reshape(-1)
+    y = np.asarray(y).reshape(-1)
+    p = np.clip(p, 1e-12, 1-1e-12)
+    return float(-np.mean(y*np.log(p) + (1-y)*np.log(1-p)))
+
+def accuracy_from_probs(p, y) -> float:
+    p = np.asarray(p).reshape(-1)
+    y = np.asarray(y).reshape(-1)
+    pred = (p >= 0.5).astype(np.int32)
+    return float(np.mean(pred == (y >= 0.5)))
+
+# ------------********------------
+# =========================== SPSA
+# ------------********------------
+
+class Adam:
+    def __init__(self, shape, lr=0.05, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.m = np.zeros(shape, dtype=np.float64)
+        self.v = np.zeros(shape, dtype=np.float64)
+        self.lr = lr; self.b1 = beta1; self.b2 = beta2; self.eps = eps; self.t = 0
+    def step(self, params, grad):
+        self.t += 1
+        self.m = self.b1*self.m + (1-self.b1)*grad
+        self.v = self.b2*self.v + (1-self.b2)*(grad*grad)
+        m_hat = self.m / (1 - self.b1**self.t)
+        v_hat = self.v / (1 - self.b2**self.t)
+        params -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+        return params
+
+def spsa_epoch(params: np.ndarray,
+               S_in: np.ndarray,
+               y: np.ndarray,
+               a0: float,
+               c0: float,
+               k: int,
+               alpha: float = 0.602,
+               gamma: float = 0.101,
+               rng=None):
+    
+    # One SPSA iteration:
+      # a_k = a0 / (k+1)^alpha,
+       # c_k = c0 / (k+1)^gamma,
+      #  ĝ  = (L(θ+c_kΔ) - L(θ-c_kΔ)) / (2c_k) * Δ^{-1}
+    
+    if rng is None:
+        rng = np.random.default_rng()
+    ak = a0 / ((k+1)**alpha)
+    ck = c0 / ((k+1)**gamma)
+    delta = rng.choice([-1.0, 1.0], size=params.shape)
+    thetap = params + ck*delta
+    thetam = params - ck*delta
+
+    Up = circuit_unitary(thetap)
+    Um = circuit_unitary(thetam)
+    p_plus  = probs_from_unitary(Up, S_in)
+    p_minus = probs_from_unitary(Um, S_in)
+    Lp = bce_loss(p_plus, y)
+    Lm = bce_loss(p_minus, y)
+    ghat = ((Lp - Lm) / (2.0*ck)) * (1.0 / delta)
+    return float((Lp+Lm)/2.0), ghat, ak
+
+# ------------********------------
+# =========================== Single run: training + hardware probe
+# ------------********------------
+
+def run_single_qnn_hardware(H_layers: int,
+                            epochs: int,
+                            augment: int,
+                            noise_std: float,
+                            lr: float,
+                            acc_tol: float,
+                            seed: int,
+                            spsa_a0: float,
+                            spsa_c0: float,
+                            optimizer: str,
+                            sampler: SamplerV2,
+                            pass_manager,
+                            shots: int,
+                            backend_name: str) -> dict:
+   
+    print(f"[run_single] H={H_layers}, seed={seed}, epochs={epochs}")
+
+    # ---- Data ----
+    X, y = make_xor_dataset(augment_per_corner=augment, noise_std=noise_std, seed=seed)
+    y = y.astype(np.float64).reshape(-1, 1)
+    S_in = encode_states_matrix(X)   # (4, N)
+    n_samples = int(X.shape[0])
+
+    # ---- Init parameters ----
+    rng = np.random.default_rng(seed)
+    params = rng.normal(0.0, 0.15, size=(H_layers, 4)).astype(np.float64)
+    n_params = int(H_layers * 4)
+
+    # ---- Training (host) ----
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    opt = Adam(params.shape, lr=lr)
+    last_loss = None
+
+    if optimizer.lower() == "spsa":
+        for k in range(epochs):
+            loss, ghat, ak = spsa_epoch(params, S_in, y,
+                                        a0=spsa_a0, c0=spsa_c0, k=k, rng=rng)
+            params = opt.step(params, ak * ghat)
+            last_loss = loss
+    else:
+        # Exact parameter-shift (very slow, but kept for completeness)
+        shift = math.pi/2.0
+        for _ in range(epochs):
+            U = circuit_unitary(params)
+            p = probs_from_unitary(U, S_in)
+            last_loss = bce_loss(p, y)
+            p_clip = np.clip(p, 1e-12, 1-1e-12)
+            dLdp = (p_clip - y.reshape(-1)) / (p_clip*(1-p_clip))
+            grad = np.zeros_like(params)
+            for l in range(H_layers):
+                for kk in range(4):
+                    params_plus  = params.copy(); params_plus[l, kk]  += shift
+                    params_minus = params.copy(); params_minus[l, kk] -= shift
+                    p_plus  = probs_from_unitary(circuit_unitary(params_plus),  S_in)
+                    p_minus = probs_from_unitary(circuit_unitary(params_minus), S_in)
+                    dp = 0.5 * (p_plus - p_minus)
+                    grad[l, kk] = float(np.mean(dLdp * dp))
+            params = opt.step(params, grad)
+
+# ------------********------------
+    # ---- Final ideal metrics ----
+    U_final = circuit_unitary(params)
+    p_final = probs_from_unitary(U_final, S_in)
+    acc = accuracy_from_probs(p_final, y)
+    host_runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    peak_mem_mb = float(peak / (1024**2))
+
+# ------------********------------
+    # ---- Hardware evaluation: XOR corners only ----
+
+#This block augments the classical QNN XOR evaluation with a lightweight hardware inference run and accounts for its execution time.
+#It combines host-side and hardware runtimes, then assembles a comprehensive result dictionary 
+#    with accuracy, loss, timing, memory, and model size metrics.
+#Additional fields record backend details and per-input hardware measurement probabilities for diagnostic analysis.
+
+    hw = hardware_eval_qnn_xor(sampler, pass_manager, params, shots=shots)
+
+    total_runtime_s = host_runtime + hw["hardware_runtime_s"]
+
+    return {
+        "H": int(H_layers),
+        "epochs": int(epochs),
+        "augment_per_corner": int(augment),
+        "noise_std": float(noise_std),
+        "seed": int(seed),
+        "final_loss": float(last_loss if last_loss is not None else bce_loss(p_final, y)),
+        "accuracy": float(acc),
+        "success": bool(acc >= acc_tol),        # success metric based on IDEAL accuracy
+        "runtime_s": float(total_runtime_s),
+        "host_runtime_s": float(host_runtime),
+        "hardware_runtime_s": float(hw["hardware_runtime_s"]),
+        "peak_mem_mb": float(peak_mem_mb),
+        "n_samples": n_samples,
+        "n_params": n_params,
+        "backend_name": backend_name,
+        "shots": int(shots),
+        # Hardware XOR diagnostics:
+        "hardware_accuracy_xor": float(hw["hardware_accuracy"]),
+        "hw_p00": float(hw["probs"][0]),
+        "hw_p01": float(hw["probs"][1]),
+        "hw_p10": float(hw["probs"][2]),
+        "hw_p11": float(hw["probs"][3]),
+    }
+
+# ------------********------------
+# =========================== Carbon I/O (latest year per country)
+# ------------********------------
+
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    """
+    Resolve the CO2 intensity file on Desktop (or absolute path).
+    Accepts .csv or .xlsx/.xls.
+    """
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+
+    # Fallback: let pandas raise if not found
+    return str(p)
+
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+    """
+    Load CO2 intensity table from CSV or Excel and keep latest year per country.
+    Columns auto-detected: country, year, intensity.
+    Intensity is returned in kgCO2e/kWh.
+    """
+    p = pathlib.Path(path)
+    ext = p.suffix.lower()
+    if ext == ".csv":
+        df = pd.read_csv(path)
+    else:
+        df = pd.read_excel(path)
+
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k,v in cols.items()
+                    if "country" in k or "nation" in k or k=="location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found in CO2 file.")
+
+    year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k,v in cols.items()
+                      if "intensity" in k
+                      or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k
+                      or "gco2" in k), None)
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column detected.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country", "Year", "Intensity"] if len(keep)==3 else ["Country", "Intensity"]
+
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country", as_index=False).tail(1)
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:   # likely g/kWh → kg/kWh
+        df["Intensity"] = df["Intensity"] / 1000.0
+
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+def compute_carbon(perf_df: pd.DataFrame,
+                   intensity_df: pd.DataFrame,
+                   power_watts: float,
+                   pue: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Carbon from PERFORMANCE runtimes only (sum over all runs).
+    Uses perf_df['runtime_s'] which already includes host + QPU time.
+    """
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "power_watts": [power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ------------********------------
+# =========================== Plotting helpers 
+# ------------********------------
+#plt_kwargs defines shared Matplotlib save options (DPI and tight layout) reused across all figures.
+#plot_performance and plot_scalability visualize how runtime, accuracy, and memory scale with the number of QNN layers H.
+#plot_reliability summarizes success rates and accuracy distributions across H, 
+#   while plot_carbon shows country-wise CO₂ impact and emission distributions.
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+def plot_performance(df: pd.DataFrame, outdir: str):
+    g = df.groupby("H")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["H"], g["runtime_s"], marker="o")
+    plt.title("Performance: Runtime vs layers H")
+    plt.xlabel("H (layers)"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_runtime_vs_H_qnn_xor_ibm.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("H")["accuracy"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["H"], g2["accuracy"], marker="s")
+    plt.title("Performance: Mean ideal accuracy vs H")
+    plt.xlabel("H (layers)"); plt.ylabel("Accuracy (ideal)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_accuracy_vs_H_qnn_xor_ibm.png"), **plt_kwargs)
+    plt.close()
+
+def plot_scalability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("H")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.loglog(g["H"], g["runtime_s"], marker="o")
+    plt.title("Scalability: Runtime vs H (log-log)")
+    plt.xlabel("H (layers)"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_runtime_vs_H_loglog_qnn_xor_ibm.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("H")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["H"], g2["peak_mem_mb"], marker="^")
+    plt.title("Scalability: Peak memory vs H")
+    plt.xlabel("H (layers)"); plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_peakmem_vs_H_qnn_xor_ibm.png"), **plt_kwargs)
+    plt.close()
+
+def plot_reliability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("H")["success"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["H"], g["success"], marker="o")
+    plt.ylim(-0.05, 1.05)
+    plt.title("Reliability: Success rate vs H (ideal acc ≥ tol)")
+    plt.xlabel("H (layers)"); plt.ylabel("Success rate")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_success_vs_H_qnn_xor_ibm.png"), **plt_kwargs)
+    plt.close()
+
+    data = [df[df["H"]==k]["accuracy"].values for k in sorted(df["H"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["H"].unique()))
+    plt.title("Reliability: Ideal accuracy distribution by H")
+    plt.xlabel("H (layers)"); plt.ylabel("Accuracy (ideal)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_accuracy_boxplot_qnn_xor_ibm.png"), **plt_kwargs)
+    plt.close()
+
+def plot_carbon(df: pd.DataFrame, outdir: str):
+    top = df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8,5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Carbon: Top 15 countries (kgCO2e)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "carbon_top15_qnn_xor_ibm.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(df["kgCO2e"], bins=30)
+    plt.title("Carbon: Emission distribution")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "carbon_distribution_qnn_xor_ibm.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+# =========================== IBM HARDWARE HELPERS (SamplerV2 + transpilation)
+# ------------********------------
+
+#def get_ibm_sampler initializes an IBM Quantum SamplerV2 primitive for executing circuits on a specified real backend.
+#It loads the saved Qiskit Runtime account, selects the target backend, and reports basic hardware properties and shot count.
+#The function prepares an ISA-compliant preset pass manager and returns the backend, sampler, and pass manager for downstream use.
+
+def get_ibm_sampler(backend_name: str, shots: int):
+    
+    print("[ibm] Initializing QiskitRuntimeService (using saved account)...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = SamplerV2(mode=backend)  
+    return backend, sampler, pm
+
+    #Build 2-qubit QNN circuit in Qiskit for each XOR input in X_test.
+    #- Encode input: RY(pi*x1) on q0, RY(pi*x2) on q1
+    #- Ansatz: H layers of [RY0, RY1, CX(0,1), RZ0, RZ1]
+    #- Measure q1 only (1-bit classical register).
+
+def build_qnn_xor_circuits_qiskit(params: np.ndarray,
+                                  X_test: np.ndarray) -> List[QuantumCircuit]:
+    H_layers = params.shape[0]
+    circuits = []
+    for x1, x2 in X_test:
+        qc = QuantumCircuit(2, 1)
+        # encoding
+        qc.ry(math.pi * float(x1), 0)
+        qc.ry(math.pi * float(x2), 1)
+        # ansatz layers
+        for l in range(H_layers):
+            ry0, ry1, rz0, rz1 = params[l]
+            qc.ry(float(ry0), 0)
+            qc.ry(float(ry1), 1)
+            qc.cx(0, 1)
+            qc.rz(float(rz0), 0)
+            qc.rz(float(rz1), 1)
+        # measure ONLY q1 → c0 (so counts '0'/'1' correspond directly to q1)
+        qc.measure(1, 0)
+        circuits.append(qc)
+    return circuits
+
+def hardware_eval_qnn_xor(sampler: SamplerV2,
+                          pass_manager,
+                          params: np.ndarray,
+                          shots: int) -> Dict[str, float | np.ndarray]:
+    """
+    Run QNN XOR classification for the 4 XOR base inputs on real IBM hardware:
+
+      (0,0) → 0
+      (0,1) → 1
+      (1,0) → 1
+      (1,1) → 0
+
+    Returns:
+      - probs: length-4 array of P(q1=1) per input (hardware)
+      - hardware_accuracy: XOR accuracy from those probs (≥0.5 threshold)
+      - hardware_runtime_s: wall-clock time of the Sampler job.
+    """
+    X_base = np.array([[0,0],[0,1],[1,0],[1,1]], dtype=np.float64)
+    y_base = np.array([0,1,1,0], dtype=np.float64)
+
+    # Build and transpile circuits for each XOR input
+    circuits = build_qnn_xor_circuits_qiskit(params, X_base)
+    isa_circuits = pass_manager.run(circuits)
+
+    print("[hardware] Submitting 4 QNN XOR circuits to IBM backend...")
+    t0 = time.perf_counter()
+    job = sampler.run(isa_circuits, shots=shots)
+    primitive_result = job.result()
+    qpu_time = time.perf_counter() - t0
+    print(f"[hardware] QNN XOR job finished in {qpu_time:.3f} s (wall-clock).")
+
+    # Use PubResult.join_data().get_counts() to be register-name agnostic
+    probs = []
+    for pub_res in primitive_result:
+        # join_data returns a DataSet with combined counts over all cregs
+        joined = pub_res.join_data()
+        counts = joined.get_counts()   # dict bitstring -> counts
+
+        total = sum(counts.values())
+        if total > 0:
+            # one measured bit → keys '0' and/or '1'
+            p1 = counts.get("1", 0) / total
+        else:
+            p1 = 0.0
+        probs.append(p1)
+
+    probs = np.array(probs, dtype=np.float64)
+    hw_acc = accuracy_from_probs(probs, y_base)
+
+    return {
+        "probs": probs,
+        "hardware_accuracy": float(hw_acc),
+        "hardware_runtime_s": float(qpu_time),
+    }
+# ------------********------------
+# =========================== Notebook entry point
+# ------------********------------
+
+def run_qnn_xor_ibm_hardware_notebook(
+    sizes=(2, 4, 8, 16),
+    steps: int = 500,
+    trials: int = 10,
+    augment_per_corner: int = 16,
+    noise_std: float = 0.05,
+    optimizer: str = "spsa",
+    spsa_a0: float = 0.05,
+    spsa_c0: float = 0.05,
+    lr: float = 0.02,
+    acc_tol: float = 0.99,
+    backend_name: str = "ibm_torino",
+    shots: int = 256,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = "carbon_by_country",
+):
+ 
+    # QNN XOR benchmarks with real IBM hardware in the loop.
+    # Training is ideal (noiseless, fast 4×4 unitaries).
+    # Hardware is used once per (H, seed) to execute 4 QNN XOR circuits (00,01,10,11).
+    # The total runtime per run is:
+    #    runtime_s = host_runtime_s + hardware_runtime_s
+
+    sizes = list(sizes)
+    print("[qnn-xor-ibm] QNN XOR IBM hardware benchmark")
+    print("  H layers:", sizes)
+    print(f"  steps={steps}, trials={trials}, augment={augment_per_corner}, noise_std={noise_std}")
+    print(f"  optimizer={optimizer}, spsa_a0={spsa_a0}, spsa_c0={spsa_c0}, lr={lr}, acc_tol={acc_tol}")
+    print(f"  backend={backend_name}, shots={shots}")
+
+    # Desktop output folders
+    desktop = pathlib.Path.home() / "Desktop"
+    perf_dir = desktop / "Performance"
+    scal_dir = desktop / "Scalability"
+    rel_dir  = desktop / "Reliability"
+    carb_root = desktop / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_root, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print("  Output folders:")
+    print(f"    Performance -> {perf_dir}")
+    print(f"    Scalability -> {scal_dir}")
+    print(f"    Reliability -> {rel_dir}")
+    print(f"    Carbon      -> {carb_dir}")
+
+    # IBM backend + SamplerV2
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+
+    rows: List[dict] = []
+    total_jobs = len(sizes) * trials
+    job_idx = 0
+
+    for H in sizes:
+        for t in range(trials):
+            job_idx += 1
+            seed = 1000 + 17*H + t
+            print(f"\n[qnn-xor-ibm] Job {job_idx}/{total_jobs}: H={H}, trial={t+1}/{trials}, seed={seed}")
+            row = run_single_qnn_hardware(
+                H_layers=H,
+                epochs=steps,
+                augment=augment_per_corner,
+                noise_std=noise_std,
+                lr=lr,
+                acc_tol=acc_tol,
+                seed=seed,
+                spsa_a0=spsa_a0,
+                spsa_c0=spsa_c0,
+                optimizer=optimizer,
+                sampler=sampler,
+                pass_manager=pm,
+                shots=shots,
+                backend_name=backend.name,
+            )
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    print("\n[qnn-xor-ibm] Finished all runs. Example rows:")
+    print(df.head())
+
+# ------------********------------
+    # ---------- Performance ----------
+    perf_xlsx = perf_dir / "performance_qnn_xor_ibm_hardware.xlsx"
+    perf_agg = df.groupby("H").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        std_runtime_s=("runtime_s","std"),
+        mean_host_runtime_s=("host_runtime_s","mean"),
+        mean_hardware_runtime_s=("hardware_runtime_s","mean"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        mean_accuracy=("accuracy","mean"),
+        std_accuracy=("accuracy","std"),
+        success_rate=("success","mean"),
+        mean_params=("n_params","mean"),
+        mean_samples=("n_samples","mean"),
+        mean_hw_accuracy_xor=("hardware_accuracy_xor","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(df, str(perf_dir))
+    print(f"[qnn-xor-ibm] Performance Excel written to: {perf_xlsx}")
+
+# ------------********------------
+    # ---------- Scalability ----------
+    scal_xlsx = scal_dir / "scalability_qnn_xor_ibm_hardware.xlsx"
+    scal_agg = df.groupby("H").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        std_runtime_s=("runtime_s","std"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        std_peak_mem_mb=("peak_mem_mb","std"),
+        mean_n_params=("n_params","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_xlsx, engine="openpyxl") as w:
+            df[["H","runtime_s","peak_mem_mb","n_params"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            scal_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_scalability(df, str(scal_dir))
+    print(f"[qnn-xor-ibm] Scalability Excel written to: {scal_xlsx}")
+
+# ------------********------------
+    # ---------- Reliability ----------
+    rel_xlsx = rel_dir / "reliability_qnn_xor_ibm_hardware.xlsx"
+    rel_agg = df.groupby("H").agg(
+        success_rate=("success","mean"),
+        mean_acc=("accuracy","mean"),
+        std_acc=("accuracy","std"),
+        mean_hw_acc=("hardware_accuracy_xor","mean"),
+        std_hw_acc=("hardware_accuracy_xor","std"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_xlsx, engine="openpyxl") as w:
+            df[["H","seed","accuracy","success","hardware_accuracy_xor"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability(df, str(rel_dir))
+    print(f"[qnn-xor-ibm] Reliability Excel written to: {rel_xlsx}")
+
+# ------------********------------
+    # ---------- Carbon ----------
+    excel_path = resolve_excel_path_notebook(excel_filename)
+    intensity_df = None
+    try:
+        intensity_df = load_carbon_excel(excel_path, year_select=year_select)
+        print(f"[carbon] Loaded CO2 intensity table from: {excel_path}")
+    except Exception as e:
+        print(f"[carbon] ERROR reading '{excel_path}': {e}")
+        print("[carbon] Skipping carbon benchmark.")
+        intensity_df = None
+
+    carbon_df = None
+    summary_df = None
+
+    if intensity_df is not None:
+        carbon_df, summary_df = compute_carbon(
+            df, intensity_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_xlsx = carb_dir / "carbon_qnn_xor_ibm_hardware.xlsx"
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_xlsx, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input")
+
+        plot_carbon(carbon_df, str(carb_dir))
+        print(f"[carbon] Carbon Excel written to: {carb_xlsx}")
+
+    print("\n[qnn-xor-ibm] All benchmarks complete.")
+    return {
+        "perf_df": df,
+        "perf_dir": str(perf_dir),
+        "scal_dir": str(scal_dir),
+        "rel_dir": str(rel_dir),
+        "carbon_dir": str(carb_dir),
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }

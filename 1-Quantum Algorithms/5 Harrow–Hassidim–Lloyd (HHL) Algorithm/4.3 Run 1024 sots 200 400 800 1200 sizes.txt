@@ -1,0 +1,12 @@
+results_hhl = run_hhl_ibm_hardware_notebook(
+    sizes=(200, 400, 800, 1200),             # logical problem sizes N (same as noiseless, or smaller)
+    trials=2,                     # number of random seeds per N
+    backend_name="ibm_torino",    # or "ibm_fez", "ibm_marrakesh", etc.
+    shots=1024,                    # keep small to stay low-resource
+
+    # Carbon / device parameters
+    excel_filename="Filtered_CO2_intensity_236_Countries.csv",  
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country_hhl",  # subfolder under Desktop/Carbon footprints

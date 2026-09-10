@@ -1,0 +1,21 @@
+results_qnn_ibm = run_qnn_xor_ibm_hardware_notebook(
+    sizes=(2, 4, 8, 16),
+    steps=500,
+    trials=10,
+    augment_per_corner=16,
+    noise_std=0.05,
+    optimizer="spsa",
+    spsa_a0=0.05,
+    spsa_c0=0.05,
+    lr=0.02,
+    acc_tol=0.99,
+    backend_name="ibm_torino",
+    shots=256,
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country",
+)
+
+results_qnn_ibm["perf_df"].head()

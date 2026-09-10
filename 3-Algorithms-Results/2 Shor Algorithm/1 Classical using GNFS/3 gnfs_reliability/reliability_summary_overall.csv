@@ -1,0 +1,2 @@
+Label,Threads,Total_Runs,Success_Rate,Method_GNFS_Rate,Median_s,P95_s,P99_s,Timeout_Fails,NonzeroExit_Fails,WrongFactor_Fails,Method_Mismatch
+Reliability GNFS (YAFU),1,39,0.846154,1.0,0.196638,0.290011,0.331978,0,0,6,0

@@ -1,0 +1,17 @@
+results = run_vqe_ibm_hardware_notebook(
+    sizes=(2, 4, 6),      # ⬅️ increased system sizes
+    steps=3,              # keep small for hardware
+    layers=1,
+    seeds_per_N=1,
+    lr=0.05,
+    J=1.0,
+    h=1.05,
+    periodic=False,
+    early_stop=True,
+    patience=2,
+    min_delta=1e-3,
+    backend_name="ibm_torino",   # or "ibm_fez" / "ibm_marrakesh"
+    shots=1024,           # ⬅️ increased shots
+    device_power_watts=65.0,
+    pue=1.2,
+)

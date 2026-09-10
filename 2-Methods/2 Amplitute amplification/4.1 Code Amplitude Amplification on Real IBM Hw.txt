@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# quantum_amplitude_amplification_ibm_hardware_light_notebook.py
+
+# - Bulk statistics (success_rate, mean_queries, mean_grover_k, etc.)
+#   are computed with the SAME ideal/noiseless algorithm as quantum_amplitude_amplification_noiseless.py.
+# - For each N, ONE actual Grover circuit is run on a real IBM backend
+#   using SamplerV2 to measure hardware success on a single marked item.
+
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+# ------------********------------ Imports
+#These imports provide system utilities for timing, memory tracking, filesystem handling, and math operations.
+#NumPy and pandas support numerical processing and structured data analysis, while Matplotlib is set up for headless plotting.
+#Typing helpers improve readability and maintainability through explicit type annotations.
+#Qiskit runtime and circuit components enable building, transpiling, and executing quantum programs on IBM backends.
+
+import os, time, warnings, pathlib, tracemalloc, math
+from typing import List
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+# ------------********------------
+# ======================== Ideal Grover helpers ========================
+# ------------********------------
+
+#This function creates a boolean mask representing a fixed number of marked elements in a search space.
+#It validates inputs, randomly selects unique indices, and marks them efficiently using NumPy.
+
+def make_marked_mask(N: int, M: int, rng: np.random.Generator) -> np.ndarray:
+    """Boolean mask of length N with exactly M marked items."""
+    if M < 0 or M > N:
+        raise ValueError(f"Invalid M={M} for N={N}")
+    mask = np.zeros(N, dtype=bool)
+    if M > 0:
+        idx = rng.choice(N, size=M, replace=False)
+        mask[idx] = True
+    return mask
+
+#This helper computes the recommended number of Grover iterations based on problem size and marked items.
+#It follows the standard theoretical scaling law and enforces a minimum iteration count when applicable.
+def grover_iterations_k(N: int, M: int) -> int:
+    """k ≈ round((π/4)*sqrt(N/M)); force ≥1 when M>0."""
+    if M <= 0:
+        return 0
+    k = int(round((math.pi/4.0) * math.sqrt(N / M)))
+    return max(1, k)
+
+
+#These following functions implement the core components of an ideal Grover iteration.
+#The phase oracle flips the sign of marked amplitudes, while the diffusion step reflects amplitudes about the mean.
+
+def phase_oracle_inplace(state: np.ndarray, mask: np.ndarray):
+    """Phase flip on marked indices (ideal, noiseless)."""
+    state[mask] *= -1.0
+
+def diffusion_inplace(state: np.ndarray):
+    """Diffusion operator for uniform |s>: state <- 2*avg - state."""
+    avg = state.mean()
+    state[:] = 2.0 * avg - state
+
+#The combined cycle applies both operations in sequence to amplify marked states.
+def grover_cycle(state: np.ndarray, mask: np.ndarray):
+    """One Grover iteration: phase oracle then diffusion."""
+    phase_oracle_inplace(state, mask)
+    diffusion_inplace(state)
+
+def run_instance_ideal(N: int, M: int, rng: np.random.Generator):
+   
+    #One quantum search instance (ideal):
+    #  - Random marked set S of size M
+    #  - Prepare uniform |s>
+     # - Apply k Grover iterations
+      #- Measure once; return (success, queries_used, k)
+  
+    mask = make_marked_mask(N, M, rng)
+    k = grover_iterations_k(N, M)
+    if M == 0 or k == 0:
+        return False, 0, 0
+
+    state = np.ones(N, dtype=np.complex128) / math.sqrt(N)
+
+    for _ in range(k):
+        grover_cycle(state, mask)
+
+    probs = (state.real**2 + state.imag**2)
+    s = probs.sum()
+    if s <= 0.0:
+        probs = np.ones(N)/N
+    else:
+        probs = probs / s
+
+    i = rng.choice(N, p=probs)
+    success = bool(mask[i])
+    queries_used = k
+    return success, queries_used, k
+
+
+#This routine runs multiple ideal Grover search trials for fixed parameters and a random seed.
+#It measures success rates, query counts, and iteration budgets while tracking time and memory usage.
+#Aggregate metrics are computed across all steps to summarize algorithm behavior.
+#The function returns a structured dictionary of results for downstream analysis and reporting.
+
+def run_single_ideal(N: int, steps: int, acc_tol: float, seed: int, M: int) -> dict:
+
+    rng = np.random.default_rng(seed)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    successes = 0
+    queries_total = 0
+    budgets = []
+
+    for _ in range(steps):
+        ok, q, k = run_instance_ideal(N, M, rng)
+        successes += int(ok)
+        queries_total += q
+        budgets.append(k)
+
+    host_runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    success_rate = successes / max(1, steps)
+    mean_q = queries_total / max(1, steps)
+    mean_k = float(np.mean(budgets)) if budgets else 0.0
+
+    return {
+        "N": int(N),
+        "steps": int(steps),
+        "seed": int(seed),
+        "M": int(M),
+        "success_rate": float(success_rate),
+        "mean_queries": float(mean_q),
+        "mean_grover_k": mean_k,
+        "success": bool(success_rate >= acc_tol),
+        "host_runtime_s": float(host_runtime),
+        "runtime_s": float(host_runtime),   # will adjust with hardware time
+        "peak_mem_mb": float(peak / (1024**2)),
+        "instances_processed": int(steps),
+    }
+
+# ------------********------------
+# ======================== IBM hardware Grover (single run per N) ========================
+# ------------********------------
+
+def build_oracle_phase_flip(qc: QuantumCircuit, target_index: int, qubits):
+    
+    # Apply a phase flip (-1) to a single basis state |target_index> on the given qubits.
+    # Qubits are assumed little-endian (qubit 0 = LSB).
+    
+    num_qubits = len(qubits)
+    bitstr = format(target_index, f"0{num_qubits}b")  # MSB...LSB
+
+    # Map |bitstr> to |11..1> via X gates on 0 bits
+    for i, b in enumerate(bitstr[::-1]):  # bitstr[::-1]: LSB at index 0
+        if b == "0":
+            qc.x(qubits[i])
+
+    # multi-controlled Z on |11..1>
+    if num_qubits == 1:
+        qc.z(qubits[0])
+    else:
+        qc.h(qubits[-1])
+        qc.mcx(qubits[:-1], qubits[-1])
+        qc.h(qubits[-1])
+
+    # Uncompute X gates
+    for i, b in enumerate(bitstr[::-1]):
+        if b == "0":
+            qc.x(qubits[i])
+
+
+#This function appends a standard Grover diffusion operator to an existing quantum circuit.
+#It performs a reflection about the uniform superposition using layers of Hadamard and X gates.
+#A multi-controlled Z operation implements the phase flip on the all-ones state.
+#The final X and Hadamard gates restore the original basis while completing the inversion-about-the-mean step.
+
+def build_diffuser(qc: QuantumCircuit, qubits):
+    num_qubits = len(qubits)
+    # H, X
+    for q in qubits:
+        qc.h(q)
+        qc.x(q)
+
+    # multi-controlled Z on |11..1>
+    if num_qubits == 1:
+        qc.z(qubits[0])
+    else:
+        qc.h(qubits[-1])
+        qc.mcx(qubits[:-1], qubits[-1])
+        qc.h(qubits[-1])
+
+    # X, H
+    for q in qubits:
+        qc.x(q)
+        qc.h(q)
+
+#This utility computes the probability of successfully measuring a target basis state.
+#It converts raw sampler counts into a normalized success rate while handling endianness correctly.
+#The function safely returns zero when no measurement shots are available.
+def counts_to_success_rate(counts: dict, num_qubits: int, target_index: int) -> float:
+
+    total = sum(counts.values())
+    if total == 0:
+        return 0.0
+
+    target_bitstr = format(target_index, f"0{num_qubits}b")  # MSB..LSB
+    success_shots = 0
+
+    for bitstr, cnt in counts.items():
+        # bitstr is 'c[n-1]...c[0]' with c[0] = qubit 0 (LSB)
+        idx = int(bitstr[::-1], 2)   # reverse for little-endian integer
+        if idx == target_index:
+            success_shots += cnt
+
+    return success_shots / total
+
+
+#This function initializes access to an IBM Quantum backend via the Qiskit Runtime service.
+#It selects the requested backend, reports key hardware characteristics, and configures shot counts.
+#A preset transpilation pass manager and a sampler instance are prepared for executing quantum circuits.
+def get_ibm_sampler(backend_name: str, shots: int):
+    print("[ibm] Initializing QiskitRuntimeService...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = SamplerV2(mode=backend)
+    return backend, sampler, pm
+
+def hardware_grover_single(
+    N: int,
+    M: int,
+    backend_name: str,
+    sampler: SamplerV2,
+    pass_manager,
+    shots: int,
+) -> dict:
+    
+    # Run ONE Grover search instance on IBM hardware for given N, M:
+    #  - N = 2^n (power of two required).
+     # - Mark a single basis state |target_index> (fixed deterministic choice per N).
+     # - k = grover_iterations_k(N, M).
+     # - Circuit:
+     #       H^{⊗n} |0...0> -> k Grover iterations -> measure.
+     # - Return hardware_runtime_s and hardware_success_rate_single.
+  
+    if M <= 0:
+        raise ValueError("M must be >= 1 for a nontrivial hardware Grover test.")
+
+    num_qubits = int(round(math.log2(N)))
+    if (1 << num_qubits) != N:
+        raise ValueError(f"N={N} is not a power of two; required for hardware Grover.")
+
+    if backend.num_qubits < num_qubits:
+        raise ValueError(
+            f"Backend {backend_name} has only {backend.num_qubits} qubits, "
+            f"but N={N} requires num_qubits={num_qubits}."
+        )
+
+    k = grover_iterations_k(N, M)
+
+    # Choose a deterministic marked index for reproducibility
+    # (e.g. N//3 mod N, but ensure it's <N)
+    target_index = (N // 3) % N
+
+    qc = QuantumCircuit(num_qubits, num_qubits)
+    qubits = list(range(num_qubits))
+
+    # Uniform superposition
+    qc.h(qubits)
+
+    # k Grover iterations: phase oracle then diffuser
+    for _ in range(k):
+        build_oracle_phase_flip(qc, target_index, qubits)
+        build_diffuser(qc, qubits)
+
+    # Measure all qubits
+    qc.measure(qubits, qubits)
+
+    isa_circ = pass_manager.run([qc])
+
+    print(f"[qaa-ibm-light] Submitting 1 Grover circuit (N={N}, M={M}, k={k}) to backend {backend_name}...")
+    t0_hw = time.perf_counter()
+    job = sampler.run(isa_circ, shots=shots)
+    primitive_result = job.result()
+    hw_runtime = time.perf_counter() - t0_hw
+    print(f"[qaa-ibm-light] Hardware job finished in {hw_runtime:.3f} s.")
+
+    pub_res = primitive_result[0]
+    joined = pub_res.join_data()
+    counts = joined.get_counts()
+
+    success_rate_hw = counts_to_success_rate(counts, num_qubits, target_index)
+
+    return {
+        "hardware_runtime_s": float(hw_runtime),
+        "hardware_success_rate_single": float(success_rate_hw),
+        "hardware_target_index": int(target_index),
+        "hardware_k": int(k),
+        "shots": int(shots),
+    }
+
+# ------------********------------
+# ======================== Carbon helpers (Desktop, latest year) ========================
+# ------------********------------
+
+#resolving carbon file path
+
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+    return str(p)
+
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+    df = pd.read_excel(path)
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k,v in cols.items()
+                    if "country" in k or "nation" in k or k=="location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found in Excel.")
+    year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k,v in cols.items()
+                      if "intensity" in k
+                      or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k
+                      or "gco2" in k), None)
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column detected.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country","Year","Intensity"] if len(keep)==3 else ["Country","Intensity"]
+
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country", as_index=False).tail(1)
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0  # g/kWh → kg/kWh
+
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+def compute_carbon(perf_df: pd.DataFrame, intensity_df: pd.DataFrame,
+                   power_watts: float, pue: float):
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "power_watts": [power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ------------********------------
+# ======================== Plotting helpers ========================
+# ------------********------------
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+# ------------********------------
+def plot_performance(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["N"], g["runtime_s"], marker="o")
+    plt.title("QAA IBM (light) Performance: Runtime vs N")
+    plt.xlabel("N")
+    plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_runtime_vs_N_qaa_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("N")["mean_queries"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["N"], g2["mean_queries"], marker="s")
+    plt.title("QAA IBM (light) Performance: Mean oracle queries vs N")
+    plt.xlabel("N")
+    plt.ylabel("Mean queries (≈k)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_queries_vs_N_qaa_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_scalability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.loglog(g["N"], g["runtime_s"], "o")
+    plt.title("QAA IBM (light) Scalability: Runtime (log–log) vs N")
+    plt.xlabel("N")
+    plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_loglog_runtime_vs_N_qaa_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("N")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["N"], g2["peak_mem_mb"], marker="^")
+    plt.title("QAA IBM (light) Scalability: Peak memory vs N")
+    plt.xlabel("N")
+    plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_peakmem_vs_N_qaa_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_reliability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["success_rate"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["N"], g["success_rate"], marker="o")
+    plt.ylim(0, 1.05)
+    plt.title("QAA IBM (light) Reliability: Success rate vs N")
+    plt.xlabel("N")
+    plt.ylabel("Success rate (ideal)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_success_vs_N_qaa_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    data = [df[df["N"]==k]["success_rate"].values for k in sorted(df["N"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["N"].unique()))
+    plt.title("QAA IBM (light) Reliability: Success-rate distribution by N")
+    plt.xlabel("N")
+    plt.ylabel("Success rate (ideal)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_success_boxplot_qaa_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_carbon(carbon_df: pd.DataFrame, outdir: str):
+    top = carbon_df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8,5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Carbon: Top 15 countries (kgCO2e) — QAA IBM (light)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "carbon_top15_qaa_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(carbon_df["kgCO2e"], bins=30)
+    plt.title("Carbon: Emission distribution — QAA IBM (light)")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "carbon_distribution_qaa_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+# ======================== Notebook entry point ========================
+# ------------********------------
+
+    #Parameters that mirror my Command Line Interface are:
+    #  sizes              : list of search space sizes N (powers of two for hardware)
+    #  steps              : instances per (N, seed) batch
+    #  trials             : seeds per N
+    #  marked_count       : M (number of marked items) — hardware assumes M >= 1
+    #  acc_tol            : success if success_rate >= acc_tol
+    #  excel_filename     : CO2 Excel (searched on Desktop or as given path)
+    #  device_power_watts : device power for carbon (kept 65.0 to match ideal)
+    #  pue                : Power Usage Effectiveness (kept 1.2 to match ideal)
+    #  year_select        : "latest" selects last year per country
+    #  outdir             : subfolder under Carbon footprints/
+    #  backend_name       : IBM backend name (e.g. "ibm_torino")
+    #  shots              : shots for the single hardware Grover circuit per N
+
+
+def run_qaa_ibm_hardware_notebook(
+    sizes=(32, 64, 128, 256),
+    steps: int = 200,
+    trials: int = 10,
+    marked_count: int = 1,
+    acc_tol: float = 0.9,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = "carbon_by_country",
+    backend_name: str = "ibm_torino",
+    shots: int = 256,  # light hardware usage
+):
+
+
+# ------------********------------
+
+    """
+    Run Quantum Amplitude Amplification (Grover) benchmarks with IBM hardware in the loop.
+
+    - For each N in sizes and each trial in 0..trials-1:
+        * Run the ideal/noiseless Grover batch (same as quantum_amplitude_amplification_noiseless.py)
+          to get success_rate, mean_queries, mean_grover_k, etc.
+    - For each N (once per N):
+        * Run a SINGLE hardware Grover circuit via SamplerV2 to measure hardware_success_rate_single.
+        * Attach this hardware_runtime_s and hardware_success_rate_single to the FIRST trial row for that N.
+    - Carbon:
+        * On first trial for each N: runtime_s = host_runtime_s + hardware_runtime_s
+        * On other trials:         runtime_s = host_runtime_s
+    """
+
+# ------------********------------
+
+
+    sizes = list(sizes)
+    print("[qaa-ibm-light] Quantum Amplitude Amplification IBM hardware benchmark (lightweight)")
+    print("  sizes (N):", sizes)
+    print(f"  steps={steps}, trials={trials}, M={marked_count}, acc_tol={acc_tol}")
+    print(f"  backend={backend_name}, shots={shots}")
+    print(f"  excel_filename={excel_filename}")
+    print(f"  power={device_power_watts} W, PUE={pue}, year_select={year_select}, outdir='{outdir}'")
+
+    # Output folders (same structure as noiseless script)
+    cwd = pathlib.Path.cwd()
+    perf_dir = cwd / "Performance"
+    scal_dir = cwd / "Scalability"
+    rel_dir  = cwd / "Reliability"
+    carb_root = cwd / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_root, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print("  Output folders:")
+    print(f"    Performance -> {perf_dir}")
+    print(f"    Scalability -> {scal_dir}")
+    print(f"    Reliability -> {rel_dir}")
+    print(f"    Carbon      -> {carb_dir}")
+
+    # IBM hardware primitives (used only once per N)
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+
+    rows: List[dict] = []
+    total_jobs = len(sizes) * trials
+    job_idx = 0
+
+    for N in sizes:
+# ------------********-------------------- Hardware Grover run (once per N) ---------
+        hw_metrics = hardware_grover_single(
+            N=N,
+            M=marked_count,
+            backend_name=backend.name,
+            sampler=sampler,
+            pass_manager=pm,
+            shots=shots,
+        )
+
+# ------------********------------------- Ideal trials for this N ---------
+        for i in range(trials):
+            job_idx += 1
+            seed = 1000 + 23*int(N) + i
+            print(f"\n[qaa-ibm-light] Job {job_idx}/{total_jobs}: N={N}, trial={i+1}/{trials}, seed={seed}")
+            res_ideal = run_single_ideal(N, steps, acc_tol, seed, marked_count)
+
+            row = dict(res_ideal)
+            row["backend_name"] = backend.name
+            row["shots"] = int(shots)
+
+            if i == 0:
+                row.update(hw_metrics)
+                row["runtime_s"] = float(res_ideal["host_runtime_s"] + hw_metrics["hardware_runtime_s"])
+            else:
+                row["hardware_runtime_s"] = 0.0
+                row["hardware_success_rate_single"] = float("nan")
+                row["hardware_target_index"] = hw_metrics["hardware_target_index"]
+                row["hardware_k"] = hw_metrics["hardware_k"]
+                row["runtime_s"] = float(res_ideal["host_runtime_s"])
+
+            rows.append(row)
+            print(f"    -> ideal_succ_rate={row['success_rate']:.3f}, "
+                  f"mean_q~{row['mean_queries']:.2f}, "
+                  f"k~{row['mean_grover_k']:.2f}, "
+                  f"runtime={row['runtime_s']:.4f}s, success={int(row['success'])}")
+
+    df = pd.DataFrame(rows)
+    print("\n[qaa-ibm-light] Finished all runs. Example rows:")
+    print(df.head())
+
+# ------------********------------
+    # ---------- Performance Excel ----------
+# ------------********------------
+
+    perf_xlsx = perf_dir / "performance_qaa_ibm_hardware_light.xlsx"
+    perf_agg = df.groupby("N").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        mean_host_runtime_s=("host_runtime_s","mean"),
+        mean_hardware_runtime_s=("hardware_runtime_s","mean"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        mean_success_rate=("success_rate","mean"),
+        mean_queries=("mean_queries","mean"),
+        mean_grover_k=("mean_grover_k","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(df, str(perf_dir))
+    print(f"[qaa-ibm-light] Performance Excel written to: {perf_xlsx}")
+
+# ------------********------------
+    # ---------- Scalability Excel ----------
+# ------------********------------
+
+    scal_xlsx = scal_dir / "scalability_qaa_ibm_hardware_light.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_xlsx, engine="openpyxl") as w:
+            df[["N","runtime_s","host_runtime_s","hardware_runtime_s","peak_mem_mb","mean_queries"]].to_excel(
+                w, index=False, sheet_name="raw"
+            )
+            df.groupby("N").mean(numeric_only=True).reset_index().to_excel(
+                w, index=False, sheet_name="aggregated"
+            )
+
+    plot_scalability(df, str(scal_dir))
+    print(f"[qaa-ibm-light] Scalability Excel written to: {scal_xlsx}")
+
+# ------------********------------
+    # ---------- Reliability Excel ----------
+# ------------********------------
+
+    rel_xlsx = rel_dir / "reliability_qaa_ibm_hardware_light.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_xlsx, engine="openpyxl") as w:
+            df[["N","seed","success_rate","mean_queries","mean_grover_k","success"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg = df.groupby("N").agg(
+                success_rate=("success_rate","mean"),
+                std_success=("success_rate","std"),
+                mean_queries=("mean_queries","mean"),
+            ).reset_index()
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability(df, str(rel_dir))
+    print(f"[qaa-ibm-light] Reliability Excel written to: {rel_xlsx}")
+
+# ------------********------------
+    # ---------- Carbon footprints ----------
+# ------------********------------
+
+    excel_path = resolve_excel_path_notebook(excel_filename)
+    carbon_df = None
+    summary_df = None
+    try:
+        intensity_df = load_carbon_excel(excel_path, year_select=year_select)
+        print(f"[carbon] Loaded CO2 intensity table from: {excel_path}")
+        carbon_df, summary_df = compute_carbon(
+            df, intensity_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_xlsx = carb_dir / "carbon_qaa_ibm_hardware_light.xlsx"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_xlsx, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input")
+
+        plot_carbon(carbon_df, str(carb_dir))
+        print(f"[carbon] Carbon Excel written to: {carb_xlsx}")
+    except Exception as e:
+        print(f"[carbon] ERROR reading Excel '{excel_path}': {e}")
+        print("[carbon] Skipping carbon benchmark. Re-run once the CO2 file is available.")
+
+    print("\n[qaa-ibm-light] All benchmarks complete.")
+    return {
+        "perf_df": df,
+        "perf_dir": str(perf_dir),
+        "scal_dir": str(scal_dir),
+        "rel_dir": str(rel_dir),
+        "carbon_dir": str(carb_dir),
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }

@@ -1,0 +1,9 @@
+python co2_from_bench_cli.py ^
+  --results-csv gnfs_benchmark_results.csv ^
+  --countries-xlsx "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --year-select latest ^
+  --device-power-watts 65 ^
+  --pue 1.2 ^
+  --outdir carbon_by_country ^
+  --combine ^
+  --label "Classical GNFS (YAFU)"

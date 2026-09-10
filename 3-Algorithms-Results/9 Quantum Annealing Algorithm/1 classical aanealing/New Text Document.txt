@@ -1,0 +1,13 @@
+python classical_annealing_benchmarks.py ^
+  --sizes 64 128 192 ^
+  --steps 1000 ^
+  --trials 10 ^
+  --p 0.2 ^
+  --field-strength 0.1 ^
+  --T0 2.0 --Tf 0.01 ^
+  --gap-tol 0.01 ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir carbon_by_country ^
+  --combine

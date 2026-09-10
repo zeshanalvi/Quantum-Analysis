@@ -1,0 +1,8 @@
+python quantum_simon_noiseless.py ^
+  --sizes 6 8 10 ^
+  --trials 10 ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir carbon_by_country ^
+  --combine

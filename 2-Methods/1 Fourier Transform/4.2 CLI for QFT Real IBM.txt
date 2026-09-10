@@ -1,0 +1,15 @@
+results_qft_ibm = run_qft_ibm_hardware_notebook(
+    sizes=(64, 128, 256, 512),
+    steps=50,
+    trials=10,
+    acc_tol=0.9,
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,   # same as my CLI
+    pue=1.2,                   # same as my CLI
+    year_select="latest",
+    outdir="carbon_by_country",
+    backend_name="ibm_torino", # or any chosen IBM backend
+    shots=256,                 # kept it small to reduce hardware load
+)
+
+results_qft_ibm["perf_df"].head()

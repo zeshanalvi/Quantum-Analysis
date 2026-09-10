@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# quantum_qft_ibm_hardware_light_notebook.py
+# Lightweight Quantum Fourier Transform (QFT) — IBM hardware in the loop
+
+# Idea:
+#   For every (N, seed) trial:
+#       Do the *same* ideal dense QFT as quantum_qft_benchmarks.py (fast CPU).
+#       Collect accuracy_mean, rmse_vs_fft, runtime_s, peak_mem_mb, success.
+#   For each N:
+#       Pick ONE representative 2-tone signal.
+#      Run a real QFT circuit for that single signal on IBM hardware via SamplerV2
+#         (only 1 circuit per N → very light).
+#       Measure hardware_runtime_s, hardware_accuracy_single, hardware_rmse_single.
+#       Attach those hardware metrics to the first trial row for that N.
+#   Total runtime for carbon:
+#       For that first row per N: runtime_s = host_runtime_s + hardware_runtime_s.
+#       For all other rows: runtime_s = host_runtime_s (no extra hardware cost).
+
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports
+#These imports provide core system utilities for timing, memory tracking, filesystem access, and numerical computation.
+#NumPy and pandas support data processing, while Matplotlib is configured for non-interactive plot generation.
+#Typing helpers improve code clarity through explicit type annotations.
+#Qiskit components enable construction, transpilation, and execution of quantum circuits on IBM backends.
+
+import os, time, warnings, pathlib, tracemalloc, math
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+# ------------********------------
+# ======================= Signal generation (copied from ideal script) =======================
+# ------------********------------
+#This function generates a synthetic real-valued signal containing one or two sinusoidal tones.
+#Frequency bins and phases are randomly selected, with special handling for very short signals.
+#Additive white Gaussian noise is scaled to achieve a specified signal-to-noise ratio.
+#The routine returns the noisy signal along with the ground-truth frequency bin indices.
+
+def make_signal_2tone(N: int, rng: np.random.Generator, snr_db: float = 30.0):
+    
+    if N < 8:
+        k1 = rng.integers(1, max(2, N//2))
+        true_bins = [int(k1)]
+    else:
+        k1 = rng.integers(1, N//2)
+        k2 = rng.integers(1, N//2 - 1)
+        if k2 >= k1:
+            k2 += 1
+        true_bins = sorted([int(k1), int(k2)])
+
+    n = np.arange(N, dtype=np.float64)
+    ph1 = rng.uniform(0, 2*np.pi)
+    ph2 = rng.uniform(0, 2*np.pi)
+    x = np.cos(2*np.pi*k1*n/N + ph1)
+    if len(true_bins) == 2:
+        x = x + np.cos(2*np.pi*k2*n/N + ph2)
+
+    sig_pow = np.mean(x**2)
+    snr_lin = 10.0**(snr_db/10.0)
+    noise_pow = sig_pow / snr_lin
+    x = x + rng.normal(0.0, math.sqrt(noise_pow), size=N)
+    return x.astype(np.float64), true_bins
+
+#These following helper functions analyze spectral outputs and quantify reconstruction quality.
+#The peak-selection routine identifies dominant frequency bins from the one-sided spectrum while ignoring DC bias.
+def topk_one_sided_bins(X: np.ndarray, k: int):
+    """Indices of top-k magnitudes from one-sided spectrum [0..N//2]."""
+    N = X.shape[0]
+    one = X[:N//2+1]
+    mag = np.abs(one)
+    if k >= 2 and len(mag) > 0:
+        mag = mag.copy()
+        mag[0] = 0.0  # suppress DC when looking for tones
+    idx = np.argsort(-mag)[:k]
+    return sorted(int(i) for i in idx)
+
+#Accuracy is measured by matching estimated peaks to known true bins within an optional tolerance.
+def accuracy_recovery(X: np.ndarray, true_bins, tol_bins: int = 0):
+    """Fraction of true bins recovered among top-k one-sided peaks."""
+    k = len(true_bins)
+    est = topk_one_sided_bins(X, k)
+    matched = sum(1 for t in true_bins if any(abs(t - e) <= tol_bins for e in est))
+    return matched / max(1, k)
+
+#A complex-valued RMSE metric summarizes numerical error between two spectral representations.
+def rmse_complex(a: np.ndarray, b: np.ndarray) -> float:
+    diff = a - b
+    return float(np.sqrt(np.mean((diff.real**2 + diff.imag**2))))
+
+# ------------********------------
+# ======================= Dense QFT (ideal) =======================
+# ------------********------------
+
+#This def qft_dense_matrix function builds the full dense matrix representation of the ideal Quantum Fourier Transform.
+#      It uses index grids to compute complex exponential phase factors and applies proper normalization.
+#     The resulting matrix can be used as a reference implementation for exact QFT behavior.
+
+def qft_dense_matrix(N: int) -> np.ndarray:
+    """Ideal QFT matrix F with entries e^{+2π i k n / N} / sqrt(N)."""
+    n = np.arange(N).reshape(1, N)
+    k = np.arange(N).reshape(N, 1)
+    return np.exp(2j * np.pi * (k @ n) / N) / math.sqrt(N)
+
+
+#This routine benchmarks an ideal, dense Quantum Fourier Transform over multiple randomized test signals.
+#    It generates normalized noisy inputs, applies the exact QFT matrix, and compares results to an FFT reference.
+#    Accuracy and numerical error are accumulated across repeated trials for statistical robustness.
+#    Execution time and peak memory usage are tracked to characterize host-side performance.
+#    The function returns a structured summary of metrics for downstream aggregation and analysis.
+
+def run_single_qft_ideal(N: int, steps: int, acc_tol: float, seed: int) -> dict:
+    rng = np.random.default_rng(seed)
+    F = qft_dense_matrix(N)  # precompute QFT once for this N
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    accs, rmses = [], []
+    for _ in range(steps):
+        x, true_bins = make_signal_2tone(N, rng, snr_db=30.0)
+        norm = np.linalg.norm(x)
+        if norm == 0.0:
+            x_amp = (np.ones(N)/math.sqrt(N)).astype(np.complex128)
+        else:
+            x_amp = (x / norm).astype(np.complex128)
+
+        # Apply ideal QFT
+        state = F @ x_amp
+
+        # Reference spectrum (matches QFT definition)
+        X_ref = np.fft.ifft(x_amp) * math.sqrt(N)
+
+        accs.append(accuracy_recovery(state, true_bins, tol_bins=0))
+        rmses.append(rmse_complex(state, X_ref))
+
+    host_runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    acc_mean = float(np.mean(accs))
+    rmse_mean = float(np.mean(rmses))
+
+    return {
+        "N": int(N),
+        "steps": int(steps),
+        "seed": int(seed),
+        "accuracy_mean": acc_mean,
+        "rmse_vs_fft": rmse_mean,
+        "success": bool(acc_mean >= acc_tol),
+        "host_runtime_s": float(host_runtime),
+        "runtime_s": float(host_runtime),  # will be updated with hardware time in the caller
+        "peak_mem_mb": float(peak / (1024**2)),
+        "signals_processed": int(steps),
+    }
+
+# ------------********------------
+# ======================= IBM hardware helpers (light usage) =======================
+# ------------********------------
+
+#The def build_qft_circuit function constructs a Quantum Fourier Transform circuit using standard quantum gates.
+#It applies Hadamard and controlled-phase rotations to build the QFT structure qubit by qubit.
+#A final series of swaps reverses qubit order to match the conventional output indexing.
+
+def build_qft_circuit(num_qubits: int) -> QuantumCircuit:
+    qc = QuantumCircuit(num_qubits)
+    for j in range(num_qubits):
+        qc.h(j)
+        for k in range(j+1, num_qubits):
+            qc.cp(np.pi / (2**(k-j)), k, j)
+    for i in range(num_qubits//2):
+        qc.swap(i, num_qubits-1-i)
+    return qc
+
+#This utility converts raw measurement counts from a quantum circuit into a probability vector.
+#It allocates a full state-length array, accumulates counts while correcting for bit-order conventions,
+#and normalizes by the total number of shots to produce a valid probability distribution.
+def counts_to_prob_vector(counts: dict, num_qubits: int) -> np.ndarray:
+    N = 1 << num_qubits
+    probs = np.zeros(N, dtype=float)
+    total = sum(counts.values())
+    if total == 0:
+        return probs
+    for bitstr, cnt in counts.items():
+        k = int(bitstr[::-1], 2)  # reverse bit order for integer
+        probs[k] += cnt
+    probs /= total
+    return probs
+
+#This function initializes access to an IBM Quantum backend through the Qiskit Runtime service.
+#      It selects the requested backend, reports key hardware properties, and configures execution settings.
+#      A preset transpilation pass manager and a sampler instance are created for running quantum circuits efficiently.
+
+def get_ibm_sampler(backend_name: str, shots: int):
+    print("[ibm] Initializing QiskitRuntimeService...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = SamplerV2(mode=backend)
+    return backend, sampler, pm
+
+def hardware_qft_single_signal(
+    x_amp: np.ndarray,
+    true_bins,
+    backend_name: str,
+    sampler: SamplerV2,
+    pass_manager,
+    shots: int,
+) -> dict:
+    
+    #Run ONE QFT circuit for a single signal on IBM hardware:
+    #  |0...0> --initialize(x_amp)--> |ψ> --QFT--> measure
+    #Returns:
+    #  - hardware_runtime_s
+    #  - hardware_accuracy_single
+    #  - hardware_rmse_single
+   
+    N = x_amp.shape[0]
+    num_qubits = int(round(math.log2(N)))
+    if (1 << num_qubits) != N:
+        raise ValueError(f"N={N} is not a power of two; required for QFT hardware run.")
+
+    # Reference X_ref magnitudes for RMSE
+    X_ref = np.fft.ifft(x_amp) * math.sqrt(N)
+    X_ref_mag = np.abs(X_ref)
+
+    qft = build_qft_circuit(num_qubits)
+    qft_gate = qft.to_gate(label=f"QFT_{num_qubits}q")
+
+    qc = QuantumCircuit(num_qubits, num_qubits)
+    qc.initialize(x_amp, range(num_qubits))
+    qc.append(qft_gate, range(num_qubits))
+    qc.measure(range(num_qubits), range(num_qubits))
+
+    isa_circ = pass_manager.run([qc])
+
+    print(f"[qft-ibm-light] Submitting 1 QFT circuit (N={N}) to backend {backend_name}...")
+    t0_hw = time.perf_counter()
+    job = sampler.run(isa_circ, shots=shots)
+    primitive_result = job.result()
+    hw_runtime = time.perf_counter() - t0_hw
+    print(f"[qft-ibm-light] Hardware job finished in {hw_runtime:.3f} s.")
+
+    pub_res = primitive_result[0]
+    joined = pub_res.join_data()
+    counts = joined.get_counts()
+
+    probs = counts_to_prob_vector(counts, num_qubits)
+    amp_mag_hw = np.sqrt(probs)   # magnitude only
+
+    acc_hw = accuracy_recovery(amp_mag_hw, true_bins, tol_bins=0)
+    rmse_hw = float(np.sqrt(np.mean((amp_mag_hw - X_ref_mag)**2)))
+
+    return {
+        "hardware_runtime_s": float(hw_runtime),
+        "hardware_accuracy_single": float(acc_hw),
+        "hardware_rmse_single": float(rmse_hw),
+    }
+
+# ------------********------------
+# ======================= Carbon helpers (Desktop, latest year) =======================
+# ------------********------------
+
+#It checks for an existing absolute path first, then looks in the user's Desktop directory.
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+    return str(p)
+
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+    df = pd.read_excel(path)
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k,v in cols.items()
+                    if "country" in k or "nation" in k or k=="location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found in Excel.")
+    year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k,v in cols.items()
+                      if "intensity" in k
+                      or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k
+                      or "gco2" in k), None)
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column detected.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country","Year","Intensity"] if len(keep)==3 else ["Country","Intensity"]
+
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country", as_index=False).tail(1)
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0  # g/kWh → kg/kWh
+
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+def compute_carbon(perf_df: pd.DataFrame, intensity_df: pd.DataFrame,
+                   power_watts: float, pue: float):
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "power_watts": [power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ------------********------------
+# ======================= Plotting helpers =======================
+# ------------********------------
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+# ------------********------------
+def plot_performance(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["N"], g["runtime_s"], marker="o")
+    plt.title("QFT IBM (light) Performance: Runtime vs N")
+    plt.xlabel("Signal length N")
+    plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_runtime_vs_N_qft_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("N")["accuracy_mean"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["N"], g2["accuracy_mean"], marker="s")
+    plt.title("QFT IBM (light) Performance: Mean accuracy vs N")
+    plt.xlabel("Signal length N")
+    plt.ylabel("Accuracy (tone recovery, ideal)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "perf_accuracy_vs_N_qft_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_scalability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.loglog(g["N"], g["runtime_s"], "o")
+    plt.title("QFT IBM (light) Scalability: Runtime (log–log) vs N")
+    plt.xlabel("Signal length N")
+    plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_loglog_runtime_vs_N_qft_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("N")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["N"], g2["peak_mem_mb"], marker="^")
+    plt.title("QFT IBM (light) Scalability: Peak memory vs N")
+    plt.xlabel("Signal length N")
+    plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "scal_peakmem_vs_N_qft_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_reliability(df: pd.DataFrame, outdir: str):
+    g = df.groupby("N")["success"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["N"], g["success"], marker="o")
+    plt.ylim(0, 1.05)
+    plt.title("QFT IBM (light) Reliability: Success rate vs N (acc ≥ tol)")
+    plt.xlabel("Signal length N")
+    plt.ylabel("Success rate (ideal)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_success_vs_N_qft_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    data = [df[df["N"]==k]["accuracy_mean"].values for k in sorted(df["N"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["N"].unique()))
+    plt.title("QFT IBM (light) Reliability: Accuracy distribution by N")
+    plt.xlabel("Signal length N")
+    plt.ylabel("Accuracy (ideal)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "rel_accuracy_boxplot_qft_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_carbon(carbon_df: pd.DataFrame, outdir: str):
+    top = carbon_df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8,5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Carbon: Top 15 countries (kgCO2e) — QFT IBM (light)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "carbon_top15_qft_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(carbon_df["kgCO2e"], bins=30)
+    plt.title("Carbon: Emission distribution — QFT IBM (light)")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "carbon_distribution_qft_ibm_light.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+# ======================= Notebook entry point =======================
+# ------------********------------
+
+def run_qft_ibm_hardware_notebook(
+    sizes=(64, 128, 256, 512),
+    steps: int = 50,
+    trials: int = 10,
+    acc_tol: float = 0.9,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = "carbon_by_country",
+    backend_name: str = "ibm_torino",
+    shots: int = 256,   # reduced shots to keep hardware usage light
+):
+    
+    #  Lightweight QFT benchmarks with a real IBM backend in the loop.
+
+    #  Ideal metrics (accuracy_mean, rmse_vs_fft, success) are computed
+    #               exactly as in quantum_qft_benchmarks.py (dense ideal QFT).
+    #  For each N, a single representative signal is run on the QPU
+    #  to get:
+    #      hardware_runtime_s,
+    #      hardware_accuracy_single,
+    #      hardware_rmse_single.
+    #  These are attached to the FIRST trial for that N.
+    #
+    #Carbon uses:
+    #    runtime_s = host_runtime_s + hardware_runtime_s (for that first trial)
+    #    runtime_s = host_runtime_s                         (for others)
+    
+    sizes = list(sizes)
+    print("[qft-ibm-light] Quantum Fourier Transform IBM hardware benchmark (lightweight)")
+    print("  sizes (N):", sizes)
+    print(f"  steps={steps}, trials={trials}, acc_tol={acc_tol}")
+    print(f"  backend={backend_name}, shots={shots}")
+    print(f"  excel_filename={excel_filename}")
+    print(f"  power={device_power_watts} W, PUE={pue}, year_select={year_select}, outdir='{outdir}'")
+
+    # Output folders (same structure as ideal script)
+    cwd = pathlib.Path.cwd()
+    perf_dir = cwd / "Performance"
+    scal_dir = cwd / "Scalability"
+    rel_dir  = cwd / "Reliability"
+    carb_root = cwd / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_root, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print("  Output folders:")
+    print(f"    Performance -> {perf_dir}")
+    print(f"    Scalability -> {scal_dir}")
+    print(f"    Reliability -> {rel_dir}")
+    print(f"    Carbon      -> {carb_dir}")
+
+    # IBM hardware primitives (used only once per N)
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+
+    rows: List[dict] = []
+    total_jobs = len(sizes)*trials
+    job_idx = 0
+
+    for N in sizes:
+        # ---------- One hardware test per N ----------
+        rng_hw = np.random.default_rng(7777 + int(N))
+        x_hw, true_bins_hw = make_signal_2tone(N, rng_hw, snr_db=30.0)
+        norm_hw = np.linalg.norm(x_hw)
+        if norm_hw == 0.0:
+            x_amp_hw = (np.ones(N)/math.sqrt(N)).astype(np.complex128)
+        else:
+            x_amp_hw = (x_hw / norm_hw).astype(np.complex128)
+
+        # Hardware run:
+        hw_metrics = hardware_qft_single_signal(
+            x_amp=x_amp_hw,
+            true_bins=true_bins_hw,
+            backend_name=backend.name,
+            sampler=sampler,
+            pass_manager=pm,
+            shots=shots,
+        )
+
+# ------------********--------------- Trials for this N (ideal QFT for each trial) ----------
+        for i in range(trials):
+            job_idx += 1
+            seed = 1000 + 37*int(N) + i
+            print(f"\n[qft-ibm-light] Job {job_idx}/{total_jobs}: N={N}, trial={i+1}/{trials}, seed={seed}")
+            ideal_res = run_single_qft_ideal(N, steps, acc_tol, seed)
+
+            row = dict(ideal_res)  # copy
+            row["backend_name"] = backend.name
+            row["shots"] = int(shots)
+
+            if i == 0:
+                # attach hardware metrics to first trial for this N
+                row.update(hw_metrics)
+                row["host_runtime_s"] = float(ideal_res["host_runtime_s"])
+                row["runtime_s"] = float(ideal_res["host_runtime_s"] + hw_metrics["hardware_runtime_s"])
+                row["hardware_test_seed"] = int(7777 + int(N))
+            else:
+                # no hardware call for subsequent trials
+                row["hardware_runtime_s"] = 0.0
+                row["hardware_accuracy_single"] = float("nan")
+                row["hardware_rmse_single"] = float("nan")
+                row["host_runtime_s"] = float(ideal_res["host_runtime_s"])
+                row["runtime_s"] = float(ideal_res["host_runtime_s"])
+                row["hardware_test_seed"] = int(7777 + int(N))
+
+            rows.append(row)
+            print(f"    -> ideal_acc={row['accuracy_mean']:.3f}, "
+                  f"ideal_rmse={row['rmse_vs_fft']:.3e}, "
+                  f"runtime={row['runtime_s']:.4f}s, success={int(row['success'])}")
+
+    df = pd.DataFrame(rows)
+    print("\n[qft-ibm-light] Finished all runs. Example rows:")
+    print(df.head())
+
+# ------------********------------
+    # ---------- i am savu=ing Performance to Excel ----------
+# ------------********------------
+
+#This block aggregates QFT experiment results by problem size and computes mean performance metrics.
+#   Both raw run data and summarized statistics are written to a multi-sheet Excel workbook.
+#   Warnings are suppressed during file output to keep logs clean.
+#   Performance plots are generated from the full dataset and the output location is reported.
+
+    perf_xlsx = perf_dir / "performance_qft_ibm_hardware_light.xlsx"
+    perf_agg = df.groupby("N").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        mean_host_runtime_s=("host_runtime_s","mean"),
+        mean_hardware_runtime_s=("hardware_runtime_s","mean"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        mean_accuracy=("accuracy_mean","mean"),
+        mean_rmse_vs_fft=("rmse_vs_fft","mean"),
+        success_rate=("success","mean"),
+        mean_signals=("signals_processed","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance(df, str(perf_dir))
+    print(f"[qft-ibm-light] Performance Excel written to: {perf_xlsx}")
+
+# ------------********------------
+    # ---------- Scalability to excel ----------
+# ------------********------------
+
+    scal_xlsx = scal_dir / "scalability_qft_ibm_hardware_light.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_xlsx, engine="openpyxl") as w:
+            df[["N","runtime_s","host_runtime_s","hardware_runtime_s","peak_mem_mb"]].to_excel(
+                w, index=False, sheet_name="raw"
+            )
+            df.groupby("N").mean(numeric_only=True).reset_index().to_excel(
+                w, index=False, sheet_name="aggregated"
+            )
+
+    plot_scalability(df, str(scal_dir))
+    print(f"[qft-ibm-light] Scalability Excel written to: {scal_xlsx}")
+
+# ------------********------------
+    # ---------- Reliability  ----------
+# ------------********------------
+
+    rel_xlsx = rel_dir / "reliability_qft_ibm_hardware_light.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_xlsx, engine="openpyxl") as w:
+            df[["N","seed","accuracy_mean","rmse_vs_fft","success"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg = df.groupby("N").agg(
+                success_rate=("success","mean"),
+                mean_acc=("accuracy_mean","mean"),
+                std_acc=("accuracy_mean","std"),
+                mean_rmse=("rmse_vs_fft","mean"),
+            ).reset_index()
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability(df, str(rel_dir))
+    print(f"[qft-ibm-light] Reliability Excel written to: {rel_xlsx}")
+
+# ------------********------------
+    # ---------- Carbon footprints ----------
+# ------------********------------
+
+    excel_path = resolve_excel_path_notebook(excel_filename)
+    carbon_df = None
+    summary_df = None
+    try:
+        intensity_df = load_carbon_excel(excel_path, year_select=year_select)
+        print(f"[carbon] Loaded CO2 intensity table from: {excel_path}")
+        carbon_df, summary_df = compute_carbon(
+            df, intensity_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_xlsx = carb_dir / "carbon_qft_ibm_hardware_light.xlsx"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_xlsx, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input")
+
+        plot_carbon(carbon_df, str(carb_dir))
+        print(f"[carbon] Carbon Excel written to: {carb_xlsx}")
+    except Exception as e:
+        print(f"[carbon] ERROR reading Excel '{excel_path}': {e}")
+        print("[carbon] Skipping carbon benchmark. Re-run once the CO2 file is available.")
+
+    print("\n[qft-ibm-light] All benchmarks complete.")
+    return {
+        "perf_df": df,
+        "perf_dir": str(perf_dir),
+        "scal_dir": str(scal_dir),
+        "rel_dir": str(rel_dir),
+        "carbon_dir": str(carb_dir),
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }

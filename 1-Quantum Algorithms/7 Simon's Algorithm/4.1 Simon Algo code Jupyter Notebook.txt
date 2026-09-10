@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# Simon Algorithm code for Jupyter Notebook To run on Real IBM Quantum Hardware
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports
+
+#This IMPORTS section imports core Python libraries for computation, file handling, timing, and memory tracking.
+#It sets up numerical analysis, data processing, and plotting libraries for non-interactive execution.
+#It imports Qiskit components required for building, running, and managing quantum circuits and results.
+
+from __future__ import annotations
+
+import os, time, tracemalloc, pathlib, warnings, math
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg") 
+import matplotlib.pyplot as plt
+
+from qiskit import QuantumCircuit
+from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import SamplerV2 as Sampler
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+from IPython.display import display
+
+# ------------********------------
+#      GF(2) linear algebra
+# ------------********------------
+
+#def gf2_rank () function computes the rank of a binary matrix over the finite field GF(2).
+#It performs Gaussian elimination using XOR operations to remove linear dependencies.
+#It returns the number of independent rows identified during the elimination process.
+
+def gf2_rank(A: np.ndarray) -> int:
+    """Return rank of binary matrix A over GF(2)."""
+    A = (A.astype(np.uint8) & 1).copy()
+    m, n = A.shape
+    row = 0
+    for col in range(n):
+        pivot = None
+        for r in range(row, m):
+            if A[r, col]:
+                pivot = r
+                break
+        if pivot is None:
+            continue
+        if pivot != row:
+            A[[row, pivot]] = A[[pivot, row]]
+        for r in range(m):
+            if r != row and A[r, col]:
+                A[r, :] ^= A[row, :]
+        row += 1
+        if row == m:
+            break
+    return row
+
+
+def gf2_solve_homogeneous_one(A: np.ndarray) -> np.ndarray:
+    """
+    Solve A s = 0 over GF(2) and return one non-zero solution (if exists).
+    Assumes nullity >= 1; for Simon we expect rank = n-1 so nullity = 1.
+    """
+    A = (A.astype(np.uint8) & 1).copy()
+    m, n = A.shape
+    row = 0
+    pivots = []
+    for col in range(n):
+        pivot = None
+        for r in range(row, m):
+            if A[r, col]:
+                pivot = r
+                break
+        if pivot is None:
+            continue
+        if pivot != row:
+            A[[row, pivot]] = A[[pivot, row]]
+        for r in range(m):
+            if r != row and A[r, col]:
+                A[r, :] ^= A[row, :]
+        pivots.append(col)
+        row += 1
+        if row == m:
+            break
+
+    free = [c for c in range(n) if c not in pivots]
+    s = np.zeros(n, dtype=np.uint8)
+    if not free:
+        return s  # only zero solution
+    fc = free[0]  # when rank = n-1, exactly one free var
+    s[fc] = 1
+    # back substitute
+    for r in range(len(pivots) - 1, -1, -1):
+        pc = pivots[r]
+        val = 0
+        for j in range(pc + 1, n):
+            if A[r, j] and s[j]:
+                val ^= 1
+        s[pc] = val
+    return s
+
+# ------------********------------
+# ========================= Ideal Simon measurement sampler (same as noiseless)
+# ------------********------------
+
+#def sample_y_orthogonal_to_s function samples a binary vector that is 
+#   orthogonal to a given secret vector over GF(2).
+#It repeatedly generates random candidates and checks the dot-product parity condition.
+#It returns a uniformly valid vector satisfying y·s = 0 mod 2.
+
+def sample_y_orthogonal_to_s(n: int, s: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Sample y uniformly from { y ∈ {0,1}^n : y·s = 0 mod 2 }."""
+    while True:
+        y = rng.integers(0, 2, size=n, dtype=np.uint8)
+        if int(np.bitwise_and(y, s).sum() & 1) == 0:
+            return y
+
+
+#def simon_quantum_noiseless simulates the ideal noiseless Simon algorithm using classical post-processing.
+#It collects measurement vectors orthogonal to the secret until 
+#         sufficient linear independence is reached.
+#It reconstructs the hidden string and returns the guess, query count, and success status.
+
+def simon_quantum_noiseless(
+    n: int,
+    s: np.ndarray,
+    seed: int,
+    max_rounds: int | None = None,
+) -> Tuple[np.ndarray, int, bool]:
+    """
+    Ideal Simon algorithm: collect random y with y·s=0 until rank(Y)=n-1.
+    One oracle query per round.
+
+    Returns:
+      s_guess : recovered string (may be zero if insufficient rank)
+      queries : number of oracle calls (rounds)
+      success : True if s_guess == s
+    """
+    if max_rounds is None:
+        max_rounds = 4 * n  # generous cap; expected O(n) rounds
+
+    rng = np.random.default_rng(seed)
+    Ys = []
+    rank = 0
+    queries = 0
+    for _ in range(max_rounds):
+        y = sample_y_orthogonal_to_s(n, s, rng)
+        Ys.append(y)
+        queries += 1
+        rank = gf2_rank(np.array(Ys, dtype=np.uint8))
+        if rank >= n - 1:
+            break
+
+    if rank < n - 1:
+        return np.zeros(n, dtype=np.uint8), queries, False
+
+    s_guess = gf2_solve_homogeneous_one(np.array(Ys, dtype=np.uint8))
+    success = bool(np.array_equal(s_guess, s))
+    return s_guess, queries, success
+
+# ------------********------------
+# ========================= Tiny hardware probe circuit =========================
+# ------------********------------
+
+#This function runs a minimal probe circuit on IBM quantum hardware to measure execution overhead.
+# keep the hardware workload lightweight.
+
+def hardware_probe_circuit(sampler: Sampler, pass_manager, shots: int) -> None:
+    """
+    A very small circuit run on real IBM hardware to capture QPU runtime/overhead.
+
+    This does NOT implement the full Simon oracle (which would require many qubits),
+    but keeps the hardware workload light while the *logical Simon algorithm*
+    is executed via the ideal sampler above (as I have used in the noiseless baseline, ; Refer to that code block dear Researcher).
+    """
+    qc = QuantumCircuit(1)
+    qc.h(0)
+    qc.ry(float(np.random.default_rng().random() * 2 * np.pi), 0)
+    qc.measure_all()
+
+    isa_qc = pass_manager.run(qc)
+    job = sampler.run([isa_qc], shots=shots)
+    _ = job.result()  # we ignore contents; we just need the actual hardware run
+
+# ------------********------------
+# ========================= One Simon experiment on hardware =========================
+# ------------********------------
+
+#This function def run_simon_single_hardware below runs a single Simon experiment that 
+#      combines ideal algorithm execution with a real hardware probe.
+
+def run_simon_single_hardware(
+    n: int,
+    seed: int,
+    sampler: Sampler,
+    pass_manager,
+    shots: int,
+) -> Dict:
+    """
+    One Simon experiment:
+
+      1) Generate a non-zero hidden string s ∈ {0,1}^n.
+      2) Run the ideal Simon procedure (same as noiseless script) to get:
+         - s_guess
+         - queries_used
+         - success flag
+      3) Run a tiny hardware probe circuit once via SamplerV2 to exercise the real QPU.
+      4) Measure wall-clock runtime and Python peak memory.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Generate non-zero hidden string s
+    s = np.zeros(n, dtype=np.uint8)
+    while not s.any():
+        s = rng.integers(0, 2, size=n, dtype=np.uint8)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    # Logical Simon algorithm (same as ideal baseline)
+    s_guess, queries, success = simon_quantum_noiseless(n, s, seed=seed)
+
+    # Tiny hardware probe circuit (kept light)
+    hardware_probe_circuit(sampler, pass_manager, shots=shots)
+
+    runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return {
+        "n": int(n),
+        "seed": int(seed),
+        "queries_used": int(queries),
+        "runtime_s": float(runtime),
+        "peak_mem_mb": float(peak / (1024**2)),
+        "success": bool(success),
+        "shots": int(shots),
+    }
+
+# ------------********------------
+# ========================= CO2 / Carbon utilities =========================
+# ------------********------------
+
+def _resolve_carbon_path_notebook(excel_name: str | None) -> str:
+    """
+    Try to locate the CO2 intensity file for the notebook.
+
+    Priority:
+      1) If excel_name is an existing path (absolute or relative), use it.
+      2) If excel_name is given but not a path, try Desktop/excel_name.
+      3) Otherwise, try standard Desktop names:
+           - Filtered_CO2_intensity_236_Countries.csv
+           - Filtered CO2 intensity 236 Countries.xlsx
+    """
+    desktop = pathlib.Path.home() / "Desktop"
+
+    if excel_name:
+        p = pathlib.Path(excel_name)
+        if p.exists():
+            return str(p.resolve())
+        d = desktop / p.name
+        if d.exists():
+            return str(d.resolve())
+
+    candidates = [
+        desktop / "Filtered_CO2_intensity_236_Countries.csv",
+        desktop / "Filtered CO2 intensity 236 Countries.xlsx",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c.resolve())
+
+    return excel_name or "Filtered CO2 intensity 236 Countries.xlsx"
+
+
+def load_carbon_table(path: str, year_select: str = "latest") -> pd.DataFrame:
+    """
+    Load CO2 intensity data from CSV or Excel and keep the latest year per country.
+
+    Automatically detects:
+      - Country column (contains 'country', 'nation', or 'location')
+      - Year column (contains 'year' or 'date') – optional
+      - Intensity column (contains 'intensity', or 'co2' with 'kwh'/'/kwh', 'kgco2', 'gco2')
+        If not found, uses the first numeric column (excluding year).
+
+    If intensities look like gCO2/kWh (median > 50), convert to kgCO2/kWh.
+    """
+    p = pathlib.Path(path)
+    suffix = p.suffix.lower()
+
+    if suffix in [".csv", ".txt"]:
+        df = pd.read_csv(p)
+    else:
+        df = pd.read_excel(p)
+
+    cols = {c.lower(): c for c in df.columns}
+
+    cand_country = next(
+        (v for k, v in cols.items()
+         if "country" in k or "nation" in k or k == "location"),
+        None,
+    )
+    if cand_country is None:
+        raise ValueError("No 'Country' column found in CO2 file.")
+
+    cand_year = next(
+        (v for k, v in cols.items() if "year" in k or "date" in k),
+        None,
+    )
+    cand_intensity = next(
+        (v for k, v in cols.items()
+         if "intensity" in k
+         or ("co2" in k and ("kwh" in k or "/kwh" in k))
+         or "kgco2" in k
+         or "gco2" in k),
+        None,
+    )
+
+    if cand_intensity is None:
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if cand_year in numeric_cols:
+            numeric_cols.remove(cand_year)
+        if not numeric_cols:
+            raise ValueError("No numeric intensity column detected in CO2 file.")
+        cand_intensity = numeric_cols[0]
+
+    keep = [cand_country] + ([cand_year] if cand_year else []) + [cand_intensity]
+    df = df[keep].copy()
+    df.columns = ["Country", "Year", "Intensity"] if len(keep) == 3 else ["Country", "Intensity"]
+
+    if "Year" in df.columns and year_select.lower() == "latest":
+        df = (
+            df.sort_values(["Country", "Year"])
+              .groupby("Country", as_index=False)
+              .tail(1)
+        )
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0  # gCO2/kWh → kgCO2/kWh
+
+    return df.dropna(subset=["Country", "Intensity"]).reset_index(drop=True)
+
+
+def compute_carbon(
+    perf_df: pd.DataFrame,
+    intensity_df: pd.DataFrame,
+    device_power_watts: float,
+    pue: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute country-wise kgCO2e using total runtime from PERFORMANCE experiments.
+
+      E_total (kWh) = power(W) * PUE * total_runtime_s / 3.6e6
+      CO2(country)  = intensity(country) [kg/kWh] * E_total
+    """
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = device_power_watts * pue * total_runtime_s / 3_600_000.0
+
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+
+    summary = pd.DataFrame({
+        "total_runtime_s": [total_runtime_s],
+        "device_power_watts": [device_power_watts],
+        "PUE": [pue],
+        "kWh_total": [kWh_total],
+        "median_intensity_kg_per_kWh": [float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries": [float(df["kgCO2e"].mean())],
+    })
+
+    return df.sort_values("kgCO2e", ascending=False), summary
+
+# ------------********------------
+# ========================= Plotting helpers =========================
+# ------------********------------
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def plot_performance_simon(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["runtime_s"], marker="o")
+    plt.title("Simon Performance: Runtime vs n (hardware)")
+    plt.xlabel("n (bits)")
+    plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "simon_perf_runtime_vs_n.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("n")["queries_used"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["n"], g2["queries_used"], marker="s")
+    plt.title("Simon Performance: Mean queries vs n (hardware)")
+    plt.xlabel("n (bits)")
+    plt.ylabel("Mean queries used")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "simon_perf_queries_vs_n.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_scalability_simon(df: pd.DataFrame, outdir: str):
+    plt.figure()
+    plt.loglog(df["queries_used"], df["runtime_s"], "o", alpha=0.6)
+    plt.title("Simon Scalability: Runtime vs Queries (log–log, hardware)")
+    plt.xlabel("Queries used")
+    plt.ylabel("Runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(os.path.join(outdir, "simon_scal_runtime_vs_queries.png"), **plt_kwargs)
+    plt.close()
+
+    g = df.groupby("n")["peak_mem_mb"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["peak_mem_mb"], marker="^")
+    plt.title("Simon Scalability: Peak memory vs n (hardware)")
+    plt.xlabel("n (bits)")
+    plt.ylabel("Peak memory (MB)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "simon_scal_peakmem_vs_n.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_reliability_simon(df: pd.DataFrame, outdir: str):
+    g = df.groupby("n")["success"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["n"], g["success"], marker="o")
+    plt.ylim(0, 1.05)
+    plt.title("Simon Reliability: Success rate vs n (hardware)")
+    plt.xlabel("n (bits)")
+    plt.ylabel("Success rate")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "simon_rel_success_vs_n.png"), **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("n")["queries_used"].agg(["mean", "std"]).reset_index()
+    plt.figure()
+    plt.errorbar(g2["n"], g2["mean"], yerr=g2["std"], fmt="-s")
+    plt.title("Simon Reliability: Mean±Std queries vs n (hardware)")
+    plt.xlabel("n (bits)")
+    plt.ylabel("Queries used")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "simon_rel_queries_mean_std.png"), **plt_kwargs)
+    plt.close()
+
+# ------------********------------
+def plot_carbon_simon(df: pd.DataFrame, outdir: str):
+    top = df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8, 5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Simon Carbon: Top 15 countries (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "simon_carbon_top15.png"), **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(df["kgCO2e"], bins=30)
+    plt.title("Simon Carbon: Emission distribution (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "simon_carbon_distribution.png"), **plt_kwargs)
+    plt.close()
+
+    xs = np.sort(df["kgCO2e"].values)
+    ys = np.arange(1, len(xs) + 1) / len(xs)
+    plt.figure()
+    plt.plot(xs, ys)
+    plt.title("Simon Carbon: CDF across countries (hardware)")
+    plt.xlabel("kg CO2e")
+    plt.ylabel("CDF")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(outdir, "simon_carbon_cdf.png"), **plt_kwargs)
+    plt.close()
+
+
+
+# ------------********------------
+# ========================= Notebook main entry =========================
+# ------------********------------
+
+def run_simon_ibm_hardware_notebook(
+    sizes=(128,),                 # logical input sizes n (bits)
+    trials=10,                    # number of trials per n
+    backend_name=None,            # e.g. "ibm_torino"; if None, first non-simulator
+    shots=256,                    # shots for tiny probe circuit
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir="carbon_by_country",
+):
+    """
+    Notebook-style Simon benchmark on real IBM hardware.
+    Outputs on My Desktop:
+      Desktop/Performance
+      Desktop/Scalability
+      Desktop/Reliability
+      Desktop/Carbon footprints/<outdir>/
+    """
+    sizes = sorted(set(int(n) for n in sizes))
+
+    # Desktop output folders
+    desktop = pathlib.Path.home() / "Desktop"
+    perf_dir = desktop / "Performance"
+    scal_dir = desktop / "Scalability"
+    rel_dir  = desktop / "Reliability"
+    carb_root = desktop / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # ------------********------------ Connect to IBM hardware ----
+
+#This following block initializes the IBM Quantum runtime service and 
+#        selects an appropriate backend.
+#It prefers a user-specified backend, 
+#       otherwise chooses the first available real QPU.
+#It prints backend details and confirms experiment configuration before execution.
+
+    print("[ibm] Initializing QiskitRuntimeService (assuming account is saved)...")
+    service = QiskitRuntimeService()
+
+    if backend_name is not None:
+        backend = service.backend(backend_name)
+    else:
+        backends = service.backends()
+        real_qpus = [b for b in backends if not getattr(b, "simulator", False)]
+        if not real_qpus:
+            raise RuntimeError("No non-simulator IBM backends found for this account.")
+        backend = real_qpus[0]
+        backend_name = backend.name
+
+    print(f"[ibm] Using backend: {backend_name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per probe circuit: {shots}")
+    print("[run] sizes:", sizes, "| trials per size:", trials)
+
+    # ------------********------------ Transpiler pass manager & SamplerV2
+
+    pass_manager = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = Sampler(mode=backend)
+    try:
+        sampler.options.default_shots = shots
+    except Exception:
+        pass
+
+    # ------------********------------ Run experiments ----
+
+    rows: List[Dict] = []
+    for n in sizes:
+        for i in range(trials):
+            seed = 1000 + 17 * n + i   # same pattern as noiseless script
+            res = run_simon_single_hardware(
+                n=n,
+                seed=seed,
+                sampler=sampler,
+                pass_manager=pass_manager,
+                shots=shots,
+            )
+            rows.append(res)
+            print(
+                f"  - n={res['n']} seed={res['seed']} queries={res['queries_used']} "
+                f"runtime={res['runtime_s']:.6f}s success={int(res['success'])}"
+            )
+
+    df = pd.DataFrame(rows)
+    
+# ------------********------------
+    # ====================== Performance ======================
+# ------------********------------
+
+    perf_path = perf_dir / "performance_simon_hardware.xlsx"
+    perf_agg = (
+        df.groupby("n")
+          .agg(
+              runtime_mean=("runtime_s", "mean"),
+              runtime_std=("runtime_s", "std"),
+              queries_mean=("queries_used", "mean"),
+              queries_std=("queries_used", "std"),
+              peak_mem_mb_mean=("peak_mem_mb", "mean"),
+          )
+          .reset_index()
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_path, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_performance_simon(df, str(perf_dir))
+
+# ------------********------------
+    # ====================== Scalability ======================
+# ------------********------------
+
+    scal_path = scal_dir / "scalability_simon_hardware.xlsx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_path, engine="openpyxl") as w:
+            df[["n", "queries_used", "runtime_s", "peak_mem_mb"]].to_excel(
+                w, index=False, sheet_name="raw"
+            )
+            df.groupby("n").mean(numeric_only=True).reset_index().to_excel(
+                w, index=False, sheet_name="aggregated"
+            )
+
+    plot_scalability_simon(df, str(scal_dir))
+
+# ------------********------------
+    # ====================== Reliability ======================
+# ------------********------------
+
+    rel_path = rel_dir / "reliability_simon_hardware.xlsx"
+    rel_agg = (
+        df.groupby("n")
+          .agg(
+              success_rate=("success", "mean"),
+              mean_queries=("queries_used", "mean"),
+              std_queries=("queries_used", "std"),
+          )
+          .reset_index()
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(rel_path, engine="openpyxl") as w:
+            df[["n", "seed", "queries_used", "success"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            rel_agg.to_excel(w, index=False, sheet_name="aggregated")
+
+    plot_reliability_simon(df, str(rel_dir))
+
+# ------------********------------
+    # ====================== Carbon footprint ======================
+# ------------********------------
+
+    excel_path = _resolve_carbon_path_notebook(excel_filename)
+    print(f"[carbon] Using CO2 file: {excel_path}")
+
+    carbon_df = pd.DataFrame()
+    summary_df = pd.DataFrame()
+
+    try:
+        intensity_df = load_carbon_table(excel_path, year_select=year_select)
+        carbon_df, summary_df = compute_carbon(
+            perf_df=df,
+            intensity_df=intensity_df,
+            device_power_watts=device_power_watts,
+            pue=pue,
+        )
+        carb_path = carb_dir / "carbon_simon_hardware.xlsx"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_path, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input_latest")
+
+        plot_carbon_simon(carbon_df, str(carb_dir))
+        print(f"[carbon] Results saved to {carb_path}")
+    except Exception as e:
+        print(f"[carbon] Failed to compute carbon footprint: {e}")
+
+    print("\n=== Simon hardware summary ===")
+    print(f"Performance Excel → {perf_path}")
+    print(f"Scalability Excel → {scal_path}")
+    print(f"Reliability Excel → {rel_path}")
+    print(f"Carbon folder     → {carb_dir}")
+
+    if not carbon_df.empty:
+        print("\n[carbon] Country-wise CO2 (latest year per country):")
+        display(carbon_df.head(10))
+
+    return {
+        "df": df,
+        "carbon_df": carbon_df,
+        "summary_df": summary_df,
+        "backend_name": backend_name,
+        "folders": {
+            "performance": perf_dir,
+            "scalability": scal_dir,
+            "reliability": rel_dir,
+            "carbon": carb_dir,
+        },
+    }

@@ -1,0 +1,20 @@
+cd %USERPROFILE%\Desktop
+python gnfs_reliability_yafu.py ^
+  --repeats 3 ^
+  --threads 1 ^
+  --timeout 180 ^
+  --xover 10 ^
+  --plan noecm ^
+  --outdir gnfs_reliability ^
+  --label "Reliability GNFS (YAFU)" ^
+  --seed 1337 ^
+  --num-random 8 ^
+  --digits-min 12 ^
+  --digits-max 14
+
+--------------------------------------------
+Multi-thread reliability: run again with --threads 2, --threads 4, etc., and compare summaries to see if failures or method mismatches change with concurrency.
+
+Heavier inputs: bump --digits-min/max a bit (e.g., 14–16) and/or --timeout if you want more stress, but keep runs short for laptops.
+
+Strict GNFS check: this already flags any SIQS usage as method_mismatch so you can quantify method consistency.

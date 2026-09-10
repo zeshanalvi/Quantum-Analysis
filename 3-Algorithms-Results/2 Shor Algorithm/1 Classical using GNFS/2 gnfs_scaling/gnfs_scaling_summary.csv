@@ -1,0 +1,4 @@
+Label,Threads,Total_Wall_Time_s,Speedup_vs_1T,Efficiency,Num_Successful_Runs
+GNFS Scaling (YAFU),1,1.779006,1.0,1.0,10
+GNFS Scaling (YAFU),2,1.753393,1.014608,0.507304,10
+GNFS Scaling (YAFU),4,1.803867,0.986218,0.246554,10

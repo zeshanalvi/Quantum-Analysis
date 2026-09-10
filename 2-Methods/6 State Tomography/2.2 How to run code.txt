@@ -1,0 +1,10 @@
+python quantum_pendulum_tomography_noiseless.py ^
+  --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+  --device-power-watts 65 --pue 1.2 ^
+  --year-select latest ^
+  --outdir "%USERPROFILE%\Desktop\Tomography_Outputs\Quantum" ^
+  --combine --workers 4 ^
+  --n-min 2 --n-max 6 --steps "8,16,32" --repeats 2 ^
+  --shots-per-angle 1500 --grid 64 ^
+  --state coherent --x0 0.8 --p0 -0.5 ^
+  --squeeze-r 0.0 --squeeze-phi 0.0

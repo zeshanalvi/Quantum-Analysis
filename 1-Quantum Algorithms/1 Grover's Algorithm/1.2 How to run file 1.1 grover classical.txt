@@ -1,0 +1,25 @@
+import os
+
+# classical Grover benchmark on n = 8..20 (N=256..1,048,576),
+# trials = 10, one marked item, CO2 Excel on Desktop, 65 W, PUE 1.2.
+
+outdir = os.path.join(
+    os.environ.get("USERPROFILE", ""),
+    "Desktop",
+    "ClassicalGroverOutputs",
+)
+
+results_classical_grover = run_classical_grover_notebook(
+    n_min=8,
+    n_max=20,
+    trials=10,
+    marked_count=1,
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir=outdir,
+    seed=7,
+)
+
+results_classical_grover["perf_df"].head()

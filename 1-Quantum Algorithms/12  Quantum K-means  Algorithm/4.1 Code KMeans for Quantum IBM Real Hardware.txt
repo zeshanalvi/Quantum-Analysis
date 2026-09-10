@@ -1,0 +1,674 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ----------------------------------------------------------------------------------------------------------------
+# quantum_kmeans_5point_ibm_notebook.py
+# Quantum kernel K-Means on 5-point 2D example — real IBM hardware.
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+# ------------********------------ Imports
+#These imports set up filesystem access, timing, warnings, memory profiling, and numerical computation for the experiment workflow.
+#They configure Matplotlib for headless plotting and include NumPy/pandas for data handling and analysis.
+#Qiskit Runtime, SamplerV2, and transpiler pass managers are imported to build and execute quantum circuits on IBM backends.
+
+import os, time, warnings, pathlib, tracemalloc, math, itertools
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+from qiskit import QuantumCircuit
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+# ------------********------------  Fixed 5-point dataset
+DATA = np.array([
+    [1.0, 1.0],
+    [2.0, 1.0],
+    [4.0, 3.0],
+    [5.0, 4.0],
+    [6.0, 5.0],
+], dtype=np.float64)
+
+
+# ------------********------------  Quantum feature map and fidelity circuits (for hardware)
+
+    # Apply feature map U(x) to |0...0>:
+    #  - H on all qubits
+    #  - For each i:  RZ(pi x_i), RX(pi x_i)
+    #  - For i<j:     RZZ(pi x_i x_j)
+def build_feature_map_state(qc: QuantumCircuit, x: np.ndarray):
+    x = np.asarray(x, dtype=float)
+    q = qc.num_qubits
+    assert len(x) == q
+
+    # H layer
+    for i in range(q):
+        qc.h(i)
+
+    # Single-qubit rotations
+    for i in range(q):
+        theta = math.pi * float(x[i])
+        qc.rz(theta, i)
+        qc.rx(theta, i)
+
+    # ZZ entanglers
+    pairs = []
+    for i in range(q):
+        for j in range(i + 1, q):
+            pairs.append((i, j))
+    for (i, j) in pairs:
+        theta = math.pi * float(x[i]) * float(x[j])
+        qc.rzz(theta, i, j)
+
+
+def build_feature_map_inverse_state(qc: QuantumCircuit, x: np.ndarray):
+    
+    # Apply U(x)†, the inverse of the feature map, assuming U(x) = H · R(x) · ZZ(x)
+    # U(x)† = ZZ(x)† · R(x)† · H.
+    
+    x = np.asarray(x, dtype=float)
+    q = qc.num_qubits
+    assert len(x) == q
+
+    # Pairs for ZZ in same order as forward
+    pairs = []
+    for i in range(q):
+        for j in range(i + 1, q):
+            pairs.append((i, j))
+
+    # Inverse ZZ (reverse order)
+    for (i, j) in reversed(pairs):
+        theta = math.pi * float(x[i]) * float(x[j])
+        qc.rzz(-theta, i, j)
+
+    # Inverse single-qubit rotations (reverse order)
+    for i in reversed(range(q)):
+        theta = math.pi * float(x[i])
+        qc.rx(-theta, i)
+        qc.rz(-theta, i)
+
+    # H layer (self-inverse)
+    for i in range(q):
+        qc.h(i)
+
+
+def build_fidelity_circuit(x: np.ndarray, z: np.ndarray) -> QuantumCircuit:
+    
+    # Circuit whose P(|0...0>) = |<ψ(x)|ψ(z)>|^2, via:
+    #   |0...0> --U(z)--> |ψ(z)> --U(x)†--> U(x)† U(z) |0...0>
+    # Measuring |0...0> probability gives the fidelity.
+    
+    x = np.asarray(x, dtype=float)
+    z = np.asarray(z, dtype=float)
+    assert x.shape == z.shape
+    q = int(x.shape[0])
+
+    qc = QuantumCircuit(q, q)
+    build_feature_map_state(qc, z)
+    build_feature_map_inverse_state(qc, x)
+    qc.measure(range(q), range(q))
+    return qc
+
+
+# ===== IBM hardware helpers =====
+
+def get_ibm_sampler(backend_name: str, shots: int):
+    
+    # Create a SamplerV2 primitive & transpiler pass manager on a real IBM backend.
+    # Assuming IBM credentials are already saved (QiskitRuntimeService).
+    
+    print("[ibm] Initializing QiskitRuntimeService with saved account...")
+    service = QiskitRuntimeService()
+    backend = service.backend(backend_name)
+    print(f"[ibm] Using backend: {backend.name}")
+    print(f"[ibm]   num_qubits={backend.num_qubits}, simulator={getattr(backend, 'simulator', False)}")
+    print(f"[ibm]   shots per circuit: {shots}")
+
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    sampler = SamplerV2(mode=backend)
+    return backend, sampler, pm
+
+
+def hardware_kernel_matrix(
+    X: np.ndarray,
+    sampler: SamplerV2,
+    pass_manager,
+    shots: int,
+) -> Tuple[np.ndarray, float]:
+
+    """
+    Estimate quantum kernel matrix K_ij = |<ψ(x_i)|ψ(x_j)>|^2 on IBM hardware.
+    Returns:
+        K (n x n), hardware_runtime_s (wall-clock).
+    """
+
+    X = np.asarray(X, dtype=float)
+    n, d = X.shape
+    q = d
+
+    circuits = []
+    for i in range(n):
+        for j in range(n):
+            circuits.append(build_fidelity_circuit(X[i], X[j]))
+
+    print(f"[kernel] Built {len(circuits)} fidelity circuits for {n} points.")
+    isa_circuits = pass_manager.run(circuits)
+
+    bitstring_zero = "0" * q
+    print("[kernel] Submitting circuits to hardware via SamplerV2...")
+    t0 = time.perf_counter()
+    job = sampler.run(isa_circuits, shots=shots)
+    primitive_result = job.result()
+    hw_time = time.perf_counter() - t0
+    print(f"[kernel] Hardware kernel evaluation completed in {hw_time:.3f} s (wall-clock).")
+
+    K = np.zeros((n, n), dtype=float)
+    idx = 0
+    for i in range(n):
+        for j in range(n):
+            pub_res = primitive_result[idx]
+            joined = pub_res.join_data()
+            counts = joined.get_counts()
+            total = sum(counts.values())
+            p0 = counts.get(bitstring_zero, 0) / total if total > 0 else 0.0
+            K[i, j] = float(p0)
+            idx += 1
+
+    # Symmetrize & clip to [0,1]
+    K = 0.5 * (K + K.T)
+    K = np.clip(K, 0.0, 1.0)
+    return K, hw_time
+
+
+# ------------********------------   Kernel K-Means (using hardware kernel matrix)
+  # Kernel K-means with cluster assignments based on kernel matrix K.
+    # Distance to cluster c (using feature-space norm):
+     #   D^2(i,c) = K_ii
+      #             - (2 / |C_c|) * sum_{j in C_c} K_ij
+        #           + (1 / |C_c|^2) * sum_{p,q in C_c} K_pq
+
+def kernel_kmeans_labels(K: np.ndarray, K_eff: int, max_iter: int, seed: int):
+   
+    K = np.asarray(K, dtype=float)
+    n = K.shape[0]
+    K_eff = max(1, min(K_eff, n))
+
+    rng = np.random.default_rng(seed)
+
+    # Initial labels: ensure no empty clusters
+    labels = np.arange(n) % K_eff
+    rng.shuffle(labels)
+
+    diag = np.diag(K)
+
+    for _ in range(max_iter):
+        # Compute squared distances D2[i, c]
+        D2 = np.zeros((n, K_eff), dtype=float)
+        for c in range(K_eff):
+            idx_c = np.where(labels == c)[0]
+            if len(idx_c) == 0:
+                D2[:, c] = 1e9
+                continue
+            n_c = len(idx_c)
+            K_ic = K[:, idx_c]                     # (n, n_c)
+            mean_K_ic = K_ic.mean(axis=1)         # (n,)
+            sum_K_cc = K[np.ix_(idx_c, idx_c)].sum()
+            term3 = sum_K_cc / (n_c * n_c)
+            D2[:, c] = diag - 2.0 * mean_K_ic + term3
+
+        new_labels = np.argmin(D2, axis=1)
+
+        # Fix potential empty clusters by reassigning farthest points
+        for c in range(K_eff):
+            if np.sum(new_labels == c) == 0:
+                far_idx = np.argmax(np.min(D2, axis=1))
+                new_labels[far_idx] = c
+
+        if np.array_equal(new_labels, labels):
+            labels = new_labels
+            break
+        labels = new_labels
+
+    return labels, K_eff
+
+
+def kernel_kmeans_inertia(K: np.ndarray, labels: np.ndarray, K_eff: int) -> float:
+
+    """
+    Compute kernel K-means inertia as sum of D^2(i, cluster(i)) over all points.
+    """
+    K = np.asarray(K, dtype=float)
+    n = K.shape[0]
+    diag = np.diag(K)
+    inertia = 0.0
+
+    for c in range(K_eff):
+        idx_c = np.where(labels == c)[0]
+        if len(idx_c) == 0:
+            continue
+        n_c = len(idx_c)
+        K_ic = K[:, idx_c]
+        mean_K_ic = K_ic.mean(axis=1)
+        sum_K_cc = K[np.ix_(idx_c, idx_c)].sum()
+        term3 = sum_K_cc / (n_c * n_c)
+
+        # D2(i,c) formula; only add for i in cluster c
+        D2_all = diag - 2.0 * mean_K_ic + term3
+        inertia += float(D2_all[idx_c].sum())
+
+    return inertia
+
+
+def clustering_accuracy_vs_reference(labels, ref_labels, K_eff: int) -> float:
+    labels = np.asarray(labels, dtype=int)
+    ref_labels = np.asarray(ref_labels, dtype=int)
+    n = labels.shape[0]
+    if n == 0:
+        return 0.0
+    best = 0.0
+    for perm in itertools.permutations(range(K_eff)):
+        perm = np.array(perm, dtype=int)
+        mapped = perm[labels]
+        acc = float(np.mean(mapped == ref_labels))
+        if acc > best:
+            best = acc
+    return best
+
+
+# ===== Carbon + plotting utilities
+
+def resolve_excel_path_notebook(excel_arg: str) -> str:
+    p = pathlib.Path(excel_arg)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    desktop = pathlib.Path.home() / "Desktop"
+    candidate = desktop / excel_arg
+    if candidate.exists():
+        return str(candidate)
+    return str(p)
+
+def load_carbon_excel(path: str, year_select: str = "latest") -> pd.DataFrame:
+    df = pd.read_excel(path)
+    cols = {c.lower(): c for c in df.columns}
+    country = next((v for k,v in cols.items() if "country" in k or "nation" in k or k=="location"), None)
+    if country is None:
+        raise ValueError("No 'Country' column found.")
+    year = next((v for k,v in cols.items() if "year" in k or "date" in k), None)
+    intensity = next((v for k,v in cols.items()
+                      if "intensity" in k
+                      or ("co2" in k and ("kwh" in k or "/kwh" in k))
+                      or "kgco2" in k
+                      or "gco2" in k), None)
+    if intensity is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if year in numeric:
+            numeric.remove(year)
+        if not numeric:
+            raise ValueError("No numeric intensity column.")
+        intensity = numeric[0]
+
+    keep = [country] + ([year] if year else []) + [intensity]
+    df = df[keep].copy()
+    df.columns = ["Country","Year","Intensity"] if len(keep)==3 else ["Country","Intensity"]
+
+    if "Year" in df.columns and year_select.lower()=="latest":
+        df = df.sort_values(["Country","Year"]).groupby("Country",as_index=False).tail(1)
+
+    med = float(df["Intensity"].dropna().median())
+    if med > 50:
+        df["Intensity"] = df["Intensity"] / 1000.0
+
+    return df.dropna(subset=["Country","Intensity"]).reset_index(drop=True)
+
+# ------------********------------ 
+def compute_carbon(perf_df, intensity_df, power_watts, pue):
+    total_runtime_s = float(perf_df["runtime_s"].sum())
+    kWh_total = power_watts * pue * total_runtime_s / 3_600_000.0
+    df = intensity_df.copy()
+    df["kWh"] = kWh_total
+    df["kgCO2e"] = df["Intensity"] * df["kWh"]
+    summary = pd.DataFrame({
+        "total_runtime_s":[total_runtime_s],
+        "power_watts":[power_watts],
+        "PUE":[pue],
+        "kWh_total":[kWh_total],
+        "median_intensity_kg_per_kWh":[float(df["Intensity"].median())],
+        "mean_kgCO2e_across_countries":[float(df["kgCO2e"].mean())],
+    })
+    return df.sort_values("kgCO2e",ascending=False), summary
+
+plt_kwargs = dict(dpi=140, bbox_inches="tight")
+
+def _boxplot_with_labels(data, labels):
+    try:
+        plt.boxplot(data, tick_labels=labels)
+    except TypeError:
+        plt.boxplot(data, labels=labels)
+
+# ------------********------------ 
+def plot_perf_scal_rel(df, perf_dir, scal_dir, rel_dir):  # Performance: runtime vs K, accuracy vs K
+   
+    g = df.groupby("K_eff")["runtime_s"].mean().reset_index()
+    plt.figure()
+    plt.plot(g["K_eff"], g["runtime_s"], "o-")
+    plt.title("Quantum K-Means (IBM hardware) — Runtime vs K")
+    plt.xlabel("K"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(perf_dir / "perf_runtime_vs_K_qkmeans_ibm.png", **plt_kwargs)
+    plt.close()
+
+    g2 = df.groupby("K_eff")["accuracy"].mean().reset_index()
+    plt.figure()
+    plt.plot(g2["K_eff"], g2["accuracy"], "s-")
+    plt.title("Quantum K-Means (IBM hardware) — Accuracy vs K")
+    plt.xlabel("K"); plt.ylabel("Accuracy vs reference")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(perf_dir / "perf_accuracy_vs_K_qkmeans_ibm.png", **plt_kwargs)
+    plt.close()
+
+    # Scalability: runtime log–log vs K
+    plt.figure()
+    plt.loglog(g["K_eff"], g["runtime_s"], "o")
+    plt.title("Scalability (log–log) — Quantum K-Means (IBM hardware)")
+    plt.xlabel("K"); plt.ylabel("Mean runtime (s)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.savefig(scal_dir / "scal_runtime_vs_K_qkmeans_ibm.png", **plt_kwargs)
+    plt.close()
+
+    # Reliability: success rate vs K + accuracy boxplot
+    g3 = df.groupby("K_eff")["success"].mean().reset_index()
+    plt.figure()
+    plt.plot(g3["K_eff"], g3["success"], "o-")
+    plt.ylim(-0.05, 1.05)
+    plt.title("Reliability — Quantum K-Means (IBM hardware)")
+    plt.xlabel("K"); plt.ylabel("Success rate (acc ≥ tol)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(rel_dir / "rel_success_vs_K_qkmeans_ibm.png", **plt_kwargs)
+    plt.close()
+
+    data = [df[df["K_eff"]==k]["accuracy"].values for k in sorted(df["K_eff"].unique())]
+    plt.figure()
+    _boxplot_with_labels(data, labels=sorted(df["K_eff"].unique()))
+    plt.title("Reliability: Accuracy distribution by K — IBM hardware")
+    plt.xlabel("K"); plt.ylabel("Accuracy vs reference")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.savefig(rel_dir / "rel_accuracy_boxplot_qkmeans_ibm.png", **plt_kwargs)
+    plt.close()
+
+# ------------********------------ 
+def plot_carbon(carbon_df, carb_dir):
+    top = carbon_df.nlargest(15, "kgCO2e")
+    plt.figure(figsize=(8,5))
+    plt.barh(top["Country"][::-1], top["kgCO2e"][::-1])
+    plt.title("Carbon: Top 15 countries (kgCO2e) — Q K-Means IBM")
+    plt.xlabel("kg CO2e")
+    plt.tight_layout()
+    plt.savefig(carb_dir / "carbon_top15_qkmeans_ibm.png", **plt_kwargs)
+    plt.close()
+
+    plt.figure()
+    plt.hist(carbon_df["kgCO2e"], bins=30)
+    plt.title("Carbon: Emission distribution — Q K-Means IBM")
+    plt.xlabel("kg CO2e")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(carb_dir / "carbon_distribution_qkmeans_ibm.png", **plt_kwargs)
+    plt.close()
+
+# ------------********------------ 
+# ===== Single run using GIVEN kernel matrix K 
+# ------------********------------ 
+
+def run_single_qkmeans_ibm(
+    K: np.ndarray,
+    K_clusters: int,
+    max_iter: int,
+    acc_tol: float,
+    seed: int,
+) -> dict:
+   
+    # One kernel K-means experiment using precomputed hardware kernel K.
+    # Note:
+    #   - This measures only host (classical) runtime.
+    #   - Hardware runtime is computed once when building K and distributed evenly later.
+    
+    n = K.shape[0]
+    K_eff = int(max(1, min(K_clusters, n)))
+
+    # Reference labels: same algorithm, but fixed seed=0
+    ref_labels, _ = kernel_kmeans_labels(K, K_eff, max_iter=max_iter, seed=0)
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    labels, K_run = kernel_kmeans_labels(K, K_eff, max_iter=max_iter, seed=seed)
+    inertia = kernel_kmeans_inertia(K, labels, K_eff)
+    acc = clustering_accuracy_vs_reference(labels, ref_labels, K_eff)
+    host_runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return {
+        "K": int(K_clusters),
+        "K_eff": int(K_eff),
+        "seed": int(seed),
+        "host_runtime_s": float(host_runtime),
+        "runtime_s": float(host_runtime),  # will be updated with hardware share
+        "peak_mem_mb": float(peak / (1024**2)),
+        "accuracy": float(acc),
+        "inertia": float(inertia),
+        "success": bool(acc >= acc_tol),
+        "n_points": int(K.shape[0]),
+    }
+
+# ------------********------------ 
+# ===== Notebook entry point =====
+# ------------********------------ 
+
+def run_qkmeans_5point_ibm_notebook(
+    sizes=(2, 3, 4),
+    steps: int = 20,                     # max_iter for kernel K-means
+    trials: int = 10,
+    acc_tol: float = 0.5,
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: str = "carbon_by_country",
+    backend_name: str = "ibm_torino",
+    shots: int = 1024,
+):
+   
+    # Quantum kernel K-Means on real IBM hardware (5-point dataset).
+    
+    # Parameters mirror the classical / ideal versions:
+    #  - sizes            : tuple of K values
+    #  - steps            : max iterations for K-means (kernel_kmeans_labels)
+    #  - trials           : trials per K (different seeds)
+    #  - acc_tol          : success if accuracy ≥ acc_tol
+    #  - excel_filename   : CO2 intensity Excel (Desktop or path)
+    #  - device_power_watts : used for carbon (default 65.0)
+    #  - pue              : Power Usage Effectiveness (default 1.2)
+    #  - year_select      : "latest" per country
+    #  - outdir           : subfolder under Carbon footprints
+    #  - backend_name     : IBM backend name (e.g., "ibm_torino")
+    #  - shots            : shots per circuit for kernel evaluation
+    
+
+    sizes = list(sizes)
+    print("[qkmeans-5pt-ibm] Quantum K-Means (kernel) on IBM hardware")
+    print("  K (sizes):", sizes)
+    print(f"  steps/max_iter={steps}, trials={trials}, acc_tol={acc_tol}")
+    print(f"  backend={backend_name}, shots={shots}")
+    print(f"  excel_filename={excel_filename}")
+    print(f"  device_power_watts={device_power_watts}, PUE={pue}, year_select={year_select}, outdir='{outdir}'")
+
+    # Output folders (current working directory)
+    cwd = pathlib.Path.cwd()
+    perf_dir = cwd / "Performance"
+    scal_dir = cwd / "Scalability"
+    rel_dir  = cwd / "Reliability"
+    carb_root = cwd / "Carbon footprints"
+    carb_dir  = carb_root / outdir
+
+    for d in [perf_dir, scal_dir, rel_dir, carb_root, carb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print("  Output folders:")
+    print(f"    Performance -> {perf_dir}")
+    print(f"    Scalability -> {scal_dir}")
+    print(f"    Reliability -> {rel_dir}")
+    print(f"    Carbon      -> {carb_dir}")
+
+   # ------------********------------   Hardware kernel evaluation (once) ----
+    backend, sampler, pm = get_ibm_sampler(backend_name, shots)
+    K, hw_time = hardware_kernel_matrix(DATA, sampler, pm, shots=shots)
+    print("[qkmeans-5pt-ibm] Kernel matrix K from hardware:\n", K)
+
+    rows: List[dict] = []
+    total_jobs = len(sizes) * trials
+    job_idx = 0
+
+    for K_clusters in sizes:
+        for t in range(trials):
+            job_idx += 1
+            seed = 1000 + 17*int(K_clusters) + t
+            print(f"\n[qkmeans-5pt-ibm] Job {job_idx}/{total_jobs}: "
+                  f"K={K_clusters}, trial={t+1}/{trials}, seed={seed}")
+            res = run_single_qkmeans_ibm(
+                K=K,
+                K_clusters=int(K_clusters),
+                max_iter=steps,
+                acc_tol=acc_tol,
+                seed=seed,
+            )
+            rows.append(res)
+            print(f"    -> acc={res['accuracy']:.3f}, inertia={res['inertia']:.4f}, "
+                  f"host_runtime={res['host_runtime_s']:.4f}s, success={int(res['success'])}")
+
+    df = pd.DataFrame(rows)
+
+    # Distribute hardware kernel evaluation time evenly across all runs for carbon accounting
+    if len(df) > 0:
+        share_per_run = hw_time / len(df)
+        df["hardware_runtime_s_share"] = share_per_run
+        df["runtime_s"] = df["host_runtime_s"] + df["hardware_runtime_s_share"]
+    else:
+        df["hardware_runtime_s_share"] = 0.0
+        df["runtime_s"] = df["host_runtime_s"]
+
+    print("\n[qkmeans-5pt-ibm] Finished all runs. Example rows:")
+    print(df.head())
+
+# ------------********------------ 
+    # ----- Performance Excel -----
+    perf_xlsx = perf_dir / "performance_results_qkmeans_ibm.xlsx"
+    perf_agg = df.groupby("K_eff").agg(
+        mean_runtime_s=("runtime_s","mean"),
+        mean_host_runtime_s=("host_runtime_s","mean"),
+        mean_hw_share_s=("hardware_runtime_s_share","mean"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        mean_accuracy=("accuracy","mean"),
+        mean_inertia=("inertia","mean"),
+        success_rate=("success","mean"),
+        mean_points=("n_points","mean"),
+    ).reset_index()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(perf_xlsx, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="raw_runs")
+            perf_agg.to_excel(w, index=False, sheet_name="aggregated")
+    print(f"[qkmeans-5pt-ibm] Performance Excel written to: {perf_xlsx}")
+
+# ------------********------------ 
+    # ----- Scalability & Reliability Excel -----
+
+    scal_xlsx = scal_dir / "scalability_results_qkmeans_ibm.xlsx"
+    rel_xlsx  = rel_dir  / "reliability_results_qkmeans_ibm.xlsx"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pd.ExcelWriter(scal_xlsx, engine="openpyxl") as w:
+            df[["K_eff","runtime_s","host_runtime_s","hardware_runtime_s_share","peak_mem_mb"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            df.groupby("K_eff").mean(numeric_only=True).reset_index().to_excel(
+                w, index=False, sheet_name="aggregated"
+            )
+
+        with pd.ExcelWriter(rel_xlsx, engine="openpyxl") as w:
+            df[["K_eff","seed","accuracy","inertia","success"]].to_excel(
+                w, index=False, sheet_name="runs"
+            )
+            df.groupby("K_eff").agg(
+                success_rate=("success","mean"),
+                mean_acc=("accuracy","mean"),
+                std_acc=("accuracy","std"),
+                mean_inertia=("inertia","mean"),
+            ).reset_index().to_excel(
+                w, index=False, sheet_name="aggregated"
+            )
+
+    print(f"[qkmeans-5pt-ibm] Scalability Excel written to: {scal_xlsx}")
+    print(f"[qkmeans-5pt-ibm] Reliability Excel written to: {rel_xlsx}")
+
+    # ----- Plots for performance, scalability, reliability -----
+    plot_perf_scal_rel(df, perf_dir, scal_dir, rel_dir)
+
+    # ----- Carbon footprints -----
+    excel_path = resolve_excel_path_notebook(excel_filename)
+    carbon_df = None
+    summary_df = None
+
+    try:
+        intensity_df = load_carbon_excel(excel_path, year_select)
+        print(f"[carbon] Loaded CO2 intensity table from: {excel_path}")
+        carbon_df, summary_df = compute_carbon(df, intensity_df, device_power_watts, pue)
+        carb_xlsx = carb_dir / "carbon_results_qkmeans_ibm.xlsx"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pd.ExcelWriter(carb_xlsx, engine="openpyxl") as w:
+                carbon_df.to_excel(w, index=False, sheet_name="per_country")
+                summary_df.to_excel(w, index=False, sheet_name="summary")
+                intensity_df.to_excel(w, index=False, sheet_name="intensity_input")
+
+        plot_carbon(carbon_df, carb_dir)
+        print(f"[carbon] Carbon Excel written to: {carb_xlsx}")
+    except Exception as e:
+        print(f"[carbon] ERROR reading Excel '{excel_path}': {e}")
+        print("[carbon] Skipping carbon benchmark.")
+
+    print("\n[qkmeans-5pt-ibm] All benchmarks complete.")
+    return {
+        "perf_df": df,
+        "perf_dir": str(perf_dir),
+        "scal_dir": str(scal_dir),
+        "rel_dir": str(rel_dir),
+        "carbon_dir": str(carb_dir),
+        "carbon_df": carbon_df,
+        "carbon_summary": summary_df,
+    }
+

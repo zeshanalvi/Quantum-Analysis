@@ -1,0 +1,33 @@
+import os
+
+# Matching my noiseless original CLI:
+# python adiabatic_quantum_noiseless.py ^
+#   --excel "Filtered CO2 intensity 236 Countries.xlsx" ^
+#   --device-power-watts 65 --pue 1.2 ^
+#   --year-select latest ^
+#   --outdir "%USERPROFILE%\Desktop\carbon_by_country" ^
+#   --combine --workers 4 ^
+#   --n-min 2 --n-max 6 --steps "1,2,4,8,16,32" --repeats 2
+
+outdir = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop", "carbon_by_country")
+
+results_adiabatic_ibm = run_adiabatic_ibm_hardware_notebook(
+    n_min=2,
+    n_max=6,
+    steps=(1, 2, 4, 8, 16, 32),      
+    repeats=2,
+    J=1.0,
+    h=0.5,
+    Gamma=1.0,
+    T=1.0,
+    excel_filename="Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts=65.0,
+    pue=1.2,
+    year_select="latest",
+    outdir=outdir,
+    backend_name="ibm_torino",          # u can change to your real IBM backend if needed
+    shots=256,
+    hardware_time_slices=8,             # kept hardware circuit shallow
+)
+
+results_adiabatic_ibm["perf_df"].head()

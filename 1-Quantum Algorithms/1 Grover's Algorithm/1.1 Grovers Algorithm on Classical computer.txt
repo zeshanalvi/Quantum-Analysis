@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ----------------------------------------------------------------------------------------------------------------
+# classical_grover_benchmarks_notebook.py
+
+# "Classical Grover" benchmark:
+#   - We simulate a classical linear search for marked items in an
+#     unsorted array of size N = 2^n, with random marked positions.
+
+# Notebook entry:
+#   results_classical_grover = run_classical_grover_notebook(...)
+#   results_classical_grover["perf_df"].head()
+# ----------------------------------------------------------------------------------------------------------------
+
+# Notes: >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# Code focuses on Performance, Scalability, Reliability, Carbon footprints
+# Output folders are:
+    #   Performance = runtime
+    #   Scalability = growth of runtime as N increases (digits/bits).
+    #   Reliability = success rate + dispersion across repetitions.
+    #   Carbon footprints = derived *only* from PERFORMANCE totals
+    #   (sum of successful wall-times), device power 65 Watts fixed for comparasion, PUE 1.2 fixed, 
+    #   country carbon intensity (kg CO2/kWh). I did not use scalability or reliability results for CO2.
+
+#      Carbon Data File: 
+#      Uses ONLY Performance runtimes (not Scalability/Reliability), 
+#      Placed on my Desktop Excel of country intensities "Filtered CO2 intensity 236 Countries.xlsx"
+#      (CSV or XLSX; year column optional. I have selected --year-select latest.)
+# ----------------------------------------------------------------------------------------------------------------
+
+# ------------********------------ Imports
+#These imports set up timing, memory profiling, warnings control, 
+#    and numerical/data-processing utilities for experiments.
+#NumPy and pandas support computation and result aggregation, 
+#    while Matplotlib is configured for headless plot generation.
+#Warnings are globally suppressed to keep benchmark output clean and focused on results.
+
+import os
+import time
+import math
+import tracemalloc
+import warnings
+from typing import List, Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# =========================
+# ------------********------------ Filesystem / utils
+# =========================
+
+#def ensure_dir creates a directory path if it does not already exist, safely handling repeated calls.
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+#def write_excel writes multiple DataFrames into a single Excel workbook with one sheet per table, falling back to CSV files on failure.
+def write_excel(tables: Dict[str, pd.DataFrame], path: str) -> None:
+    try:
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            for name, df in tables.items():
+                sheet = (name[:31] or "Sheet1")
+                df.to_excel(writer, index=False, sheet_name=sheet)
+        print(f"[OK] Wrote Excel: {path}")
+    except Exception as e:
+        print(f"[WARN] Excel write failed ({e}); writing CSVs instead.")
+        base = os.path.splitext(path)[0]
+        for name, df in tables.items():
+            csv_path = f"{base}__{name}.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"[OK] Wrote CSV fallback: {csv_path}")
+
+#def save_fig finalizes layout, saves a Matplotlib figure to disk with consistent formatting, and closes it to free resources.
+def save_fig(fig: plt.Figure, path: str, dpi: int = 150) -> None:
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Saved plot: {path}")
+
+
+def resolve_desktop_file(user_arg: Optional[str],
+                         default_candidates: List[str]) -> Optional[str]:
+    # Try to resolve a file on Desktop (or direct path) for CO2 Excel."""
+    desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+
+    def exists(p: str) -> bool:
+        return os.path.isfile(p)
+
+    if user_arg:
+        base = user_arg.strip().strip('"').strip("'")
+        # 1) direct
+        if exists(base):
+            return os.path.abspath(base)
+        # 2) Desktop\base
+        cand = os.path.join(desktop, base)
+        if exists(cand):
+            return os.path.abspath(cand)
+        # 3) if no extension, try common ones on Desktop
+        root, ext = os.path.splitext(base)
+        if not ext:
+            for e in (".xlsx", ".xls", ".csv"):
+                cand = os.path.join(desktop, root + e)
+                if exists(cand):
+                    return os.path.abspath(cand)
+        # 4) case-insensitive search on Desktop
+        tail = os.path.basename(base).lower()
+        if os.path.isdir(desktop):
+            for fname in os.listdir(desktop):
+                if fname.lower() == tail:
+                    cand = os.path.join(desktop, fname)
+                    if exists(cand):
+                        return os.path.abspath(cand)
+        return None
+
+    # if no user_arg: try default_candidates as basenames on Desktop
+    for base in default_candidates:
+        for ext in ("", ".xlsx", ".xls", ".csv"):
+            cand = os.path.join(desktop, base + ext)
+            if exists(cand):
+                return os.path.abspath(cand)
+    return None
+
+
+
+# ------------********------------ Classical "Grover" core
+#def dims_from_n_range generates a list of Hilbert-space dimensions corresponding to powers of two.
+#It computes 2^n for each integer n in the inclusive range [n_min, n_max], with basic input validation.
+
+def dims_from_n_range(n_min: int, n_max: int) -> List[int]:
+    if n_min < 1:
+        n_min = 1
+    if n_max < n_min:
+        return []
+    dims = []
+    for n in range(n_min, n_max + 1):
+        dims.append(2 ** n)
+    return dims
+
+
+def theoretical_expected_queries(N: int, marked_count: int) -> float:
+    
+    # Expected position of first marked item in a random permutation
+    # with K=marked_count marked items among N total:
+    # E[pos] = (N+1)/(K+1)  (standard order statistic result).
+    
+    if marked_count <= 0:
+        return float(N)
+    return float(N + 1) / float(marked_count + 1)
+
+
+def run_single_classical_grover(
+    N: int,
+    marked_count: int,
+    seed: int,
+) -> Dict:
+
+   # Single classical linear search:
+   #   - Universe: {0,1,...,N-1}
+   #   - Marked_count positions chosen at random
+   #   - We randomize search order (permutation) and scan until we find any
+   #     marked element.
+   # We record runtime, memory, queries, and success (should be True).
+    
+    rng = np.random.default_rng(seed)
+
+    # Sample marked positions
+    if marked_count <= 0:
+        marked_count = 1
+    marked_count = min(marked_count, N)
+    marked_positions = rng.choice(N, size=marked_count, replace=False)
+    marked_set = set(int(x) for x in marked_positions)
+
+    # Random search order
+    order = rng.permutation(N)
+
+    # Measure runtime & memory for the search itself
+    tracemalloc.start()
+    t0 = time.perf_counter()
+
+    queries = 0
+    found = False
+    found_index = None
+    for idx in order:
+        queries += 1
+        if idx in marked_set:
+            found = True
+            found_index = int(idx)
+            break
+
+    runtime = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    expected_q = theoretical_expected_queries(N, marked_count)
+    error_queries = float(queries - expected_q)
+
+    return {
+        "N": N,
+        "n_bits": int(round(math.log2(N))) if N > 0 else 0,
+        "marked_count": int(marked_count),
+        "seed": int(seed),
+        "runtime_sec": float(runtime),
+        "peak_mem_mb": peak / (1024 ** 2),
+        "queries": int(queries),
+        "expected_queries": float(expected_q),
+        "queries_ratio": float(queries / expected_q) if expected_q > 0 else np.nan,
+        "queries_error": error_queries,
+        "found": bool(found),
+        "found_index": found_index,
+    }
+
+#def run_classical_grover_benchmarks runs repeated classical unstructured-search benchmarks across problem sizes N=2^n for n in a given range.
+#It iterates over trials, seeds each run deterministically, records query counts, runtime, and memory metrics, and logs progress.
+#The function aggregates all runs into a pandas DataFrame with per-trial results and returns it.
+def run_classical_grover_benchmarks(
+    n_min: int,
+    n_max: int,
+    trials: int,
+    marked_count: int,
+    seed: int,
+) -> pd.DataFrame:
+    # Run the classical search benchmark for all N=2^n, n_min..n_max, with given trials.
+    dims = dims_from_n_range(n_min, n_max)
+    rows = []
+    for N in dims:
+        for r in range(trials):
+            s = seed + N * 1000 + r * 17
+            res = run_single_classical_grover(N, marked_count, s)
+            res["trial"] = r
+            rows.append(res)
+            print(f"[run] N={N} trial={r} queries={res['queries']} runtime={res['runtime_sec']:.6f}s")
+    if not rows:
+        return pd.DataFrame(columns=[
+            "N","n_bits","marked_count","seed","runtime_sec","peak_mem_mb",
+            "queries","expected_queries","queries_ratio","queries_error",
+            "found","found_index","trial"
+        ])
+    return pd.DataFrame(rows)
+
+
+
+# ------------********------------ Carbon helpers
+
+def load_country_co2(path: str, year_select: str = "latest") -> pd.DataFrame:
+   # Load country-level CO2 intensity (kg CO₂ / kWh) and keep latest year per country.
+    if path.lower().endswith(".csv"):
+        df = pd.read_csv(path)
+    else:
+        df = pd.read_excel(path)
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    cname = next((c for c in df.columns if "country" in c or c in ("name","nation")), None)
+    if cname is None:
+        raise ValueError("No 'country' column found in CO2 file.")
+
+    yname = next((c for c in df.columns if "year" in c), None)
+
+    cand = [c for c in df.columns if "intensity" in c]
+    if not cand:
+        cand = [c for c in df.columns if ("co2" in c and "kwh" in c)]
+    if not cand:
+        cand = [c for c in df.columns if (("kg" in c or "g" in c) and "kwh" in c)]
+    if not cand:
+        raise ValueError("No intensity column found in CO2 file.")
+    icol = cand[0]
+
+    cols = [cname, icol] + ([yname] if yname else [])
+    out = df[cols].dropna().copy()
+    out.columns = ["country","intensity_raw"] + (["year"] if yname else [])
+    out["intensity_raw"] = pd.to_numeric(out["intensity_raw"], errors="coerce")
+    out = out.dropna(subset=["intensity_raw"])
+
+    med = float(np.nanmedian(out["intensity_raw"].values))
+    if med > 10.0:
+        out["kg_per_kwh"] = out["intensity_raw"] / 1000.0
+    else:
+        out["kg_per_kwh"] = out["intensity_raw"]
+
+    out["country"] = out["country"].astype(str).str.strip().str.title()
+    if yname and year_select == "latest":
+        out = out.sort_values(["country","year"]).groupby("country", as_index=False).tail(1)
+
+    cols_out = ["country","kg_per_kwh"] + (["year"] if yname else [])
+    return out[cols_out].drop_duplicates()
+
+
+def compute_emissions(perf_df: pd.DataFrame,
+                      co2_df: pd.DataFrame,
+                      power_watts: float,
+                      pue: float) -> pd.DataFrame:
+    
+    #Compute carbon emissions for each run:
+    #  E_kWh = runtime_sec * power_watts / 3.6e6 * pue
+    #  emissions = E_kWh * kg_per_kWh
+   
+    perf = perf_df.copy()
+    perf["energy_kwh"] = (perf["runtime_sec"] * power_watts) / 3.6e6
+    perf["energy_kwh"] *= pue
+    co2 = co2_df.rename(columns={"kg_per_kwh": "kgco2_per_kwh"}).copy()
+    perf["_k"] = 1
+    co2["_k"] = 1
+    joined = perf.merge(co2, on="_k").drop(columns="_k")
+    joined["emissions_kgCO2"] = joined["energy_kwh"] * joined["kgco2_per_kwh"]
+    return joined
+
+
+def build_worstcase_country_table(perf_df: pd.DataFrame,
+                                  co2_df: pd.DataFrame,
+                                  power_watts: float,
+                                  pue: float) -> Tuple[pd.DataFrame, dict]:
+    
+    # Use the largest N and its mean runtime as a worst-case scenario,
+    # then compute per-country emissions for that scenario.
+   
+    N_heavy = int(perf_df["N"].max())
+    mask = perf_df["N"] == N_heavy
+    mean_runtime_s = float(perf_df.loc[mask, "runtime_sec"].mean())
+    energy_kwh = mean_runtime_s * power_watts / 3.6e6 * pue
+
+    tbl = co2_df.copy()
+    if "year" not in tbl.columns:
+        tbl["year"] = pd.NA
+
+    out = pd.DataFrame({
+        "Country": tbl["country"].astype(str),
+        "Year": tbl["year"],
+        "Intensity": tbl["kg_per_kwh"],
+        "kWh": energy_kwh,
+    })
+    out["kgCO2e"] = out["Intensity"] * out["kWh"]
+    out = out.sort_values("kgCO2e", ascending=False).reset_index(drop=True)
+
+    meta = {
+        "N_heavy": N_heavy,
+        "n_bits_heavy": int(round(math.log2(N_heavy))) if N_heavy > 0 else 0,
+        "mean_runtime_s": mean_runtime_s,
+        "power_watts": power_watts,
+        "pue": pue,
+        "kWh_used": energy_kwh,
+    }
+    return out, meta
+
+
+def plot_carbon_distribution(worst_table: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.hist(worst_table["kgCO2e"].values, bins=30)
+    ax.set_xlabel("kg CO2e")
+    ax.set_title("Carbon: Emission distribution (worst-case scenario)")
+    save_fig(fig, out_path)
+
+
+def plot_carbon_topN(worst_table: pd.DataFrame, N: int, out_path: str) -> None:
+    s = worst_table.sort_values("kgCO2e", ascending=False).head(N)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.barh(s["Country"], s["kgCO2e"])
+    ax.invert_yaxis()
+    ax.set_xlabel("kg CO2e")
+    ax.set_title(f"Carbon: Top {N} countries (worst-case scenario)")
+    save_fig(fig, out_path)
+
+
+def plot_carbon_median_vs_dimension(carbon_df: pd.DataFrame, out_path: str) -> None:
+    med = carbon_df.groupby("N")["emissions_kgCO2"].median().reset_index()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(med["N"], med["emissions_kgCO2"], marker="o")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Search space size N")
+    ax.set_ylabel("Median emissions (kg CO2e)")
+    ax.set_title("Median emissions vs N (classical search)")
+    save_fig(fig, out_path)
+
+
+
+# ------------********------------ Plot helpers: performance / reliability / scalability
+#The folloWing plotting functions summarize classical search benchmark results by aggregating metrics over problem size N.
+#They visualize runtime, memory usage, query counts, reliability errors, and scaling behavior using log-scaled axes where appropriate.
+#Each function produces a dedicated figure, saves it to disk with consistent formatting, and closes it to manage resources.
+
+def plot_runtime_vs_N(perf_df: pd.DataFrame, out_path: str) -> None:
+    sub = perf_df.groupby("N", as_index=False)["runtime_sec"].mean()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(sub["N"], sub["runtime_sec"], marker="o")
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xlabel("Search space size N")
+    ax.set_ylabel("Runtime (s)")
+    ax.set_title("Performance: runtime vs N (classical search)")
+    save_fig(fig, out_path)
+
+
+def plot_memory_vs_N(perf_df: pd.DataFrame, out_path: str) -> None:
+    sub = perf_df.groupby("N", as_index=False)["peak_mem_mb"].mean()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(sub["N"], sub["peak_mem_mb"], marker="s")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Search space size N")
+    ax.set_ylabel("Peak memory (MB)")
+    ax.set_title("Performance: memory vs N (classical search)")
+    save_fig(fig, out_path)
+
+
+def plot_queries_vs_N(perf_df: pd.DataFrame, out_path: str) -> None:
+    sub = perf_df.groupby("N", as_index=False)["queries"].mean()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(sub["N"], sub["queries"], marker="o", label="mean queries")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Search space size N")
+    ax.set_ylabel("Mean #queries")
+    ax.set_title("Queries vs N (classical search)")
+    save_fig(fig, out_path)
+
+
+def plot_reliability_error_vs_N(perf_df: pd.DataFrame, out_path: str) -> None:
+    sub = perf_df.groupby("N", as_index=False)["queries_error"].agg(["mean","std"]).reset_index()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.errorbar(sub["N"], sub["mean"], yerr=sub["std"], fmt="o", capsize=4)
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Search space size N")
+    ax.set_ylabel("Mean queries_error ± std")
+    ax.set_title("Reliability: queries vs theoretical expectation")
+    save_fig(fig, out_path)
+
+
+def plot_queries_ratio_hist(perf_df: pd.DataFrame, out_path: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(perf_df["queries_ratio"].values, bins=30)
+    ax.set_xlabel("queries / expected_queries")
+    ax.set_ylabel("Count")
+    ax.set_title("Reliability: queries ratio distribution")
+    save_fig(fig, out_path)
+
+
+def plot_scaling_runtime_vs_N_loglog(perf_df: pd.DataFrame, out_path: str) -> None:
+    sub = perf_df.groupby("N", as_index=False)["runtime_sec"].mean()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(sub["N"], sub["runtime_sec"], marker="o")
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xlabel("Search space size N")
+    ax.set_ylabel("Runtime (s)")
+    ax.set_title("Scalability: runtime vs N (log-log)")
+    save_fig(fig, out_path)
+
+
+# =========================
+# ------------********------------ Notebook entry point
+# =========================
+
+def run_classical_grover_notebook(
+    # problem size & repetitions
+    n_min: int = 8,
+    n_max: int = 20,
+    trials: int = 10,
+    marked_count: int = 1,
+    # carbon & CO2
+    excel_filename: str = "Filtered CO2 intensity 236 Countries.xlsx",
+    device_power_watts: float = 65.0,
+    pue: float = 1.2,
+    year_select: str = "latest",
+    outdir: Optional[str] = None,
+    # random seed
+    seed: int = 7,
+):
+    
+   # Classical Grover-style benchmark:
+   #   - For each n in [n_min, n_max], set N=2^n.
+   #   - Runs 'trials' classical linear searches with 'marked_count' targets.
+   #   - Generates 4 benchmark folders:
+   #       Performance, Scalability, Reliability, Carbon.
+   #   - Carbon uses 'device_power_watts' (default 65 W) and 'pue' (default 1.2),
+   #     plus CO2 intensity per kWh from the given Excel on Desktop.
+    
+    dims = dims_from_n_range(n_min, n_max)
+    if not dims:
+        raise ValueError("No valid powers of two in the requested n-range.")
+
+    print("[classical-grover] Benchmark settings")
+    print("  n_min:", n_min, "n_max:", n_max)
+    print("  N values:", dims)
+    print("  trials:", trials, "marked_count:", marked_count)
+    print("  excel_filename:", excel_filename)
+    print("  device_power_watts:", device_power_watts, "PUE:", pue)
+    print("  year_select:", year_select)
+
+    # Output root
+    if outdir is None:
+        root = os.getcwd()
+    else:
+        root = os.path.abspath(os.path.expandvars(outdir))
+
+    perf_dir = os.path.join(root, "Performance")
+    scal_dir = os.path.join(root, "Scalability")
+    reli_dir = os.path.join(root, "Reliability")
+    carb_dir = os.path.join(root, "Carbon")
+    for d in (perf_dir, scal_dir, reli_dir, carb_dir):
+        ensure_dir(d)
+
+    print("[INFO] Output root:", root)
+    print("       - Performance ->", perf_dir)
+    print("       - Scalability ->", scal_dir)
+    print("       - Reliability ->", reli_dir)
+    print("       - Carbon      ->", carb_dir)
+
+    # -----------------------
+    # PERFORMANCE + RELIABILITY data (one combined df)
+    # -----------------------
+
+    print("[INFO] Running classical search benchmarks ...")
+    t0_all = time.perf_counter()
+    perf_df = run_classical_grover_benchmarks(
+        n_min=n_min,
+        n_max=n_max,
+        trials=trials,
+        marked_count=marked_count,
+        seed=seed,
+    )
+    print(f"[INFO] Benchmarks completed in {time.perf_counter() - t0_all:.2f} s")
+
+    # Mark success (should all be True)
+    perf_df["success"] = perf_df["found"].astype(int)
+
+    # PERFORMANCE Excel
+    perf_summary = perf_df.groupby("N", as_index=False).agg(
+        n_bits=("n_bits","first"),
+        marked_count=("marked_count","max"),
+        trials=("trial","nunique"),
+        mean_runtime_sec=("runtime_sec","mean"),
+        std_runtime_sec=("runtime_sec","std"),
+        mean_peak_mem_mb=("peak_mem_mb","mean"),
+        std_peak_mem_mb=("peak_mem_mb","std"),
+        mean_queries=("queries","mean"),
+        std_queries=("queries","std"),
+        mean_expected_queries=("expected_queries","mean"),
+        mean_queries_ratio=("queries_ratio","mean"),
+        success_rate=("success","mean"),
+    )
+
+    perf_xlsx = os.path.join(perf_dir, "performance_classical_grover.xlsx")
+    write_excel(
+        {
+            "raw_runs": perf_df.sort_values(["N","trial"]),
+            "summary": perf_summary.sort_values("N"),
+        },
+        perf_xlsx,
+    )
+    plot_runtime_vs_N(perf_df, os.path.join(perf_dir, "runtime_vs_N.png"))
+    plot_memory_vs_N(perf_df, os.path.join(perf_dir, "memory_vs_N.png"))
+    plot_queries_vs_N(perf_df, os.path.join(perf_dir, "queries_vs_N.png"))
+
+    # -----------------------
+    # ------------********------------ RELIABILITY
+    # -----------------------
+    reli_xlsx = os.path.join(reli_dir, "reliability_classical_grover.xlsx")
+    write_excel(
+        {
+            "runs": perf_df[[
+                "N","n_bits","trial","queries","expected_queries",
+                "queries_ratio","queries_error","success"
+            ]].sort_values(["N","trial"]),
+        },
+        reli_xlsx,
+    )
+    plot_reliability_error_vs_N(perf_df, os.path.join(reli_dir, "queries_error_vs_N.png"))
+    plot_queries_ratio_hist(perf_df, os.path.join(reli_dir, "queries_ratio_hist.png"))
+
+    # -----------------------
+    # ------------********------------ SCALABILITY
+    # -----------------------
+    scal_xlsx = os.path.join(scal_dir, "scalability_classical_grover.xlsx")
+
+    # Fit runtime ~ N^alpha (log-log)
+    sub = perf_df.groupby("N", as_index=False)["runtime_sec"].mean()
+    x = np.log(sub["N"].values + 1e-16)
+    y = np.log(sub["runtime_sec"].values + 1e-16)
+    alpha, _ = np.polyfit(x, y, 1)
+    scaling_fit = pd.DataFrame({
+        "fit_parameter": ["alpha_dim_scaling"],
+        "estimate": [alpha],
+        "note": ["runtime ~ N^alpha"],
+    })
+
+    write_excel(
+        {
+            "perf_raw": perf_df.sort_values(["N","trial"]),
+            "scaling_fit": scaling_fit,
+        },
+        scal_xlsx,
+    )
+    plot_scaling_runtime_vs_N_loglog(perf_df, os.path.join(scal_dir, "runtime_vs_N_loglog.png"))
+
+    # -----------------------
+    # ------------********------------ CARBON
+    # -----------------------
+    desktop = os.path.join(os.environ.get("USERPROFILE",""), "Desktop")
+    defaults = [
+        "Filtered CO2 intensity 236 Countries",
+        "countries_co2",
+        "co2_countries",
+    ]
+    co2_path = resolve_desktop_file(excel_filename, defaults)
+
+    carbon_df = None
+    carbon_meta_df = None
+
+    if co2_path and os.path.isfile(co2_path):
+        print(f"[INFO] Using CO2 file: {co2_path}")
+        co2_df = load_country_co2(co2_path, year_select=year_select)
+        carbon_df = compute_emissions(
+            perf_df,
+            co2_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        worst_table, meta = build_worstcase_country_table(
+            perf_df,
+            co2_df,
+            power_watts=device_power_watts,
+            pue=pue,
+        )
+        carbon_meta_df = pd.DataFrame([meta])
+        carb_xlsx = os.path.join(carb_dir, "carbon_classical_grover.xlsx")
+        write_excel(
+            {
+                "co2_by_country": (co2_df.rename(columns={"kg_per_kwh":"kgco2_per_kwh"})
+                                   if "kg_per_kwh" in co2_df.columns else co2_df),
+                "emissions_all": carbon_df.sort_values(["N","country"]),
+                "worst_case_table": worst_table,
+                "worst_case_metadata": carbon_meta_df,
+            },
+            carb_xlsx,
+        )
+        plot_carbon_distribution(worst_table, os.path.join(carb_dir, "carbon_distribution.png"))
+        plot_carbon_topN(worst_table, 15, os.path.join(carb_dir, "carbon_top15.png"))
+        plot_carbon_median_vs_dimension(carbon_df, os.path.join(carb_dir, "median_emissions_vs_N.png"))
+    else:
+        print("[WARN] CO2 file not found; writing placeholder carbon workbook.")
+        carb_xlsx = os.path.join(carb_dir, "carbon_placeholder_classical_grover.xlsx")
+        placeholder = pd.DataFrame({
+            "note": ["CO2 file not provided or not found on Desktop."],
+            "hint": ["Place 'Filtered CO2 intensity 236 Countries.xlsx' on Desktop "
+                     "or pass full path via excel_filename."],
+        })
+        write_excel({"info": placeholder}, carb_xlsx)
+
+    print("\n[DONE] Classical Grover-style benchmark complete.")
+    print(f"Performance Excel:  {perf_xlsx}")
+    print(f"Scalability Excel:  {scal_xlsx}")
+    print(f"Reliability Excel:  {reli_xlsx}")
+    print(f"Carbon Excel:       {os.path.join(carb_dir, 'carbon_classical_grover.xlsx')}")
+    print("Folders under:", root)
+    print("  - Performance")
+    print("  - Scalability")
+    print("  - Reliability")
+    print("  - Carbon")
+
+    return {
+        "perf_df": perf_df,
+        "perf_dir": perf_dir,
+        "scal_dir": scal_dir,
+        "reli_dir": reli_dir,
+        "carb_dir": carb_dir,
+        "carbon_df": carbon_df,
+        "carbon_summary": carbon_meta_df,
+    }
